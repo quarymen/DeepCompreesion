@@ -1,0 +1,341 @@
+"""CAMS archive inspection and day-grouped learning curves for existing models."""
+from pathlib import Path
+import gc
+import hashlib
+import json
+import random
+import shutil
+import time
+import zipfile
+
+import netCDF4 as nc
+import numpy as np
+import pandas as pd
+import torch
+from sklearn.decomposition import PCA
+from torch.utils.data import DataLoader, TensorDataset
+
+from src.models import get_model
+from src.dct import DCTCompressor
+from src.metrics import compute_ssim
+
+
+def unpack(folder):
+    """Stream archives to disk; atomically mark successful extraction."""
+    folder = Path(folder)
+    files = list(folder.glob('*.nc')) + list(folder.glob('*.nc4'))
+    for archive in sorted(folder.glob('*.zip')):
+        dest = folder / 'unpacked' / archive.stem
+        signature = f'{archive.stat().st_size}:{archive.stat().st_mtime_ns}'
+        marker = dest / '.complete'
+        if not marker.exists() or marker.read_text() != signature:
+            dest.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(archive) as z:
+                for item in z.infolist():
+                    target = (dest / item.filename).resolve()
+                    if not target.is_relative_to(dest.resolve()):
+                        raise ValueError(f'Unsafe archive path: {item.filename}')
+                    if item.is_dir():
+                        continue
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    print('Extracting:', item.filename, f'({item.file_size / 2**30:.2f} GiB)', flush=True)
+                    partial = target.with_name(target.name + '.part')
+                    with z.open(item) as source, partial.open('wb') as out:
+                        shutil.copyfileobj(source, out, length=2**20)
+                    partial.replace(target)
+            marker.write_text(signature)
+        files.extend(dest.rglob('*.nc'))
+        files.extend(dest.rglob('*.nc4'))
+    files = sorted(set(p.resolve() for p in files))
+    if not files:
+        raise ValueError(f'No .zip, .nc or .nc4 files in {folder}')
+    return files
+
+
+def coordinate(ds, kind):
+    aliases = {'time': ['time', 'valid_time'], 'level': ['level', 'height', 'lev', 'altitude'],
+               'lat': ['latitude', 'lat'], 'lon': ['longitude', 'lon']}
+    for name in aliases[kind]:
+        if name in ds.variables:
+            return name
+    raise ValueError(f'Cannot identify {kind}: {list(ds.variables)}')
+
+
+def inspect_files(files, variable=None):
+    records, rows = [], []
+    reference = None
+    for path in files:
+        with nc.Dataset(path) as ds:
+            candidates = [n for n, v in ds.variables.items() if v.ndim >= 3 and
+                          (n.lower() in ['co', 'co_conc', 'carbon_monoxide'] or
+                           'carbon monoxide' in str(getattr(v, 'long_name', '')).lower())]
+            name = variable or (candidates[0] if len(candidates) == 1 else None)
+            if name not in ds.variables:
+                raise ValueError(f'{path.name}: set VARIABLE explicitly; variables={list(ds.variables)}')
+            v = ds[name]
+            coords = {k: coordinate(ds, k) for k in ['time', 'level', 'lat', 'lon']}
+            cv = {k: ds[n] for k, n in coords.items()}
+            dims = {k: x.dimensions[0] for k, x in cv.items() if x.ndim == 1}
+            expected = [dims[k] for k in ['time', 'lat', 'lon']]
+            if 'level' in dims:
+                expected.append(dims['level'])
+            if set(expected) != set(v.dimensions):
+                raise ValueError(f'Unsupported CO dimensions {v.dimensions}, coordinates {dims}')
+            levels = np.asarray(cv['level'][:]).reshape(-1).astype(float)
+            lat, lon = (np.asarray(cv[k][:]) for k in ['lat', 'lon'])
+            units = getattr(v, 'units', 'UNKNOWN')
+            level_units = getattr(cv['level'], 'units', 'UNKNOWN')
+            if reference is None:
+                reference = (lat, lon, units, level_units)
+            if not (np.array_equal(lat, reference[0]) and np.array_equal(lon, reference[1])
+                    and (units, level_units) == reference[2:]):
+                raise ValueError('Files have different grids or units; do not mix products.')
+            tv = cv['time']
+            dates = nc.num2date(tv[:], tv.units, calendar=getattr(tv, 'calendar', 'standard'))
+            dates = [d.isoformat() for d in dates]
+            rows.append(dict(file=path.name, variable=name, shape=str(v.shape),
+                             dimensions=str(v.dimensions), frames=len(dates),
+                             levels=levels.tolist(), units=units, first=dates[0], last=dates[-1],
+                             disk_GiB=path.stat().st_size / 2**30))
+            records.append(dict(path=path, variable=name, dims=dims, axes=v.dimensions,
+                                dates=dates, levels=levels))
+    inventory = pd.DataFrame(rows)
+    return inventory, records, reference
+
+
+def prepare(records, reference, config, output):
+    lat, lon, units, level_units = reference
+    h, w = config['crop_shape']
+    center_lat, center_lon = config['center_lat_lon']
+    if not (min(lat) <= center_lat <= max(lat) and min(lon) <= center_lon <= max(lon)):
+        raise ValueError('Crop center lies outside the dataset domain.')
+    if h > len(lat) or w > len(lon):
+        raise ValueError('Crop exceeds the native grid.')
+    y0 = int(np.clip(np.abs(lat-center_lat).argmin()-h//2, 0, len(lat)-h))
+    x0 = int(np.clip(np.abs(lon-center_lon).argmin()-w//2, 0, len(lon)-w))
+    stamps = sorted({d for r in records for d in r['dates']})
+    levels = sorted({float(z) for r in records for z in r['levels']})
+    tid, zid = {t:i for i,t in enumerate(stamps)}, {z:i for i,z in enumerate(levels)}
+    shape = (len(stamps), len(levels), h, w)
+    seen = np.zeros(shape[:2], bool)
+    raw = np.lib.format.open_memmap(output/'co_physical.npy', mode='w+', dtype='float32', shape=shape)
+    for record in records:
+        with nc.Dataset(record['path']) as ds:
+            v = ds[record['variable']]
+            dims = record['dims']
+            remaining = [a for a in record['axes'] if a != dims['time']]
+            desired = ([dims['level']] if 'level' in dims else []) + [dims['lat'], dims['lon']]
+            order = [remaining.index(a) for a in desired]
+            for local_t, stamp in enumerate(record['dates']):
+                selection = {dims['time']: local_t, dims['lat']: slice(y0,y0+h), dims['lon']: slice(x0,x0+w)}
+                block = np.ma.asarray(v[tuple(selection.get(a, slice(None)) for a in record['axes'])])
+                block = np.asarray(block.filled(np.nan), dtype='float32').transpose(order)
+                if 'level' not in dims:
+                    block = block[None]
+                i = tid[stamp]
+                zz = [zid[float(z)] for z in record['levels']]
+                if seen[i, zz].any():
+                    raise ValueError(f'Duplicate time/height: {stamp}; remove overlapping input files.')
+                if not np.isfinite(block).all():
+                    raise ValueError(f'Missing/nonfinite CO at {stamp}; inspect input before training.')
+                raw[i, zz] = block
+                seen[i, zz] = True
+        print('Prepared:', record['path'].name, flush=True)
+    if not seen.all():
+        raise ValueError('Some timestamps lack heights. Download matching height/time coverage.')
+    raw.flush()
+    lo = np.asarray(raw.min(axis=(2,3)))
+    span = np.asarray(raw.max(axis=(2,3))) - lo
+    scale = np.where(span > 0, span, 1).astype('float32')
+    normalized = np.lib.format.open_memmap(output/'co_normalized.npy', mode='w+', dtype='float32', shape=shape)
+    for i in range(len(raw)):
+        normalized[i] = (raw[i]-lo[i,:,None,None])/scale[i,:,None,None]
+    normalized.flush()
+    np.savez(output/'coordinates_scaling.npz', time=np.array(stamps), levels=levels,
+             latitude=lat[y0:y0+h], longitude=lon[x0:x0+w], minima=lo, scales=scale)
+    frame_table = pd.DataFrame({'frame':range(len(stamps)), 'time':pd.to_datetime(stamps)})
+    frame_table['day'] = frame_table.time.dt.strftime('%Y-%m-%d')
+    frame_table.to_csv(output/'frames.csv', index=False)
+    summary = dict(shape=list(shape), units=units, level_units=level_units, levels=levels,
+                   first=stamps[0], last=stamps[-1], unique_days=frame_table.day.nunique(),
+                   latitude=[float(lat[y0]),float(lat[y0+h-1])], longitude=[float(lon[x0]),float(lon[x0+w-1])],
+                   missing_hour_intervals=int((frame_table.time.diff().dropna()!=pd.Timedelta(hours=1)).sum()),
+                   float32_GiB=raw.nbytes/2**30)
+    (output/'data_summary.json').write_text(json.dumps(summary, indent=2))
+    return raw, normalized, lo, scale, frame_table, summary
+
+
+def split_days(frames, config, output):
+    days = sorted(frames.day.unique())
+    ntest, nval = max(2, round(len(days)*.16)), max(2, round(len(days)*.16))
+    gap = config['gap_days']
+    test_start = pd.Timestamp(days[-ntest])
+    before_test = [d for d in days if pd.Timestamp(d) < test_start-pd.Timedelta(days=gap)]
+    val_days = before_test[-nval:]
+    if len(val_days) != nval:
+        raise ValueError('Not enough days for validation.')
+    val_start = pd.Timestamp(val_days[0])
+    train_days = [d for d in before_test if pd.Timestamp(d) < val_start-pd.Timedelta(days=gap)]
+    if len(train_days) < 2:
+        raise ValueError('Need more days for train/validation/test with gaps.')
+    counts = sorted(set([n for n in config['train_day_counts'] if n <= len(train_days)] + [len(train_days)]))
+    # Nested, reproducible subsets of days; separate from model random seeds.
+    order = np.random.default_rng(config['subset_seed']).permutation(train_days).tolist()
+    ids = lambda ds: np.flatnonzero(frames.day.isin(ds).to_numpy())
+    splits = {'validation': ids(val_days), 'test': ids(days[-ntest:])}
+    splits.update({f'train_{n}':ids(order[:n]) for n in counts})
+    for n in counts:
+        assert not set(splits[f'train_{n}']) & set(splits['validation'])
+        assert not set(splits[f'train_{n}']) & set(splits['test'])
+    np.savez(output/'split_indices.npz', **splits)
+    labels = frames.copy()
+    labels['partition'] = 'gap'
+    for key in ['validation','test',f'train_{max(counts)}']:
+        labels.loc[splits[key], 'partition'] = 'train_pool' if key.startswith('train') else key
+    labels.to_csv(output/'partitions.csv', index=False)
+    (output/'training_days.json').write_text(json.dumps({str(n):order[:n] for n in counts}, indent=2))
+    return splits, counts
+
+
+def seed_all(seed):
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+
+def fit_ae(name, dim, train, val, config, path, device):
+    model = get_model(name, latent_dim=dim, input_shape=(1,*train.shape[1:]), dropout_rate=config['dropout']).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=config['weight_decay'])
+    loaders = [DataLoader(TensorDataset(torch.from_numpy(np.array(a, dtype='float32'))[:,None]),
+                          batch_size=config['batch_size'], shuffle=(i==0), num_workers=0)
+               for i,a in enumerate([train,val])]
+    history, best, best_epoch = [], float('inf'), None
+    for epoch in range(1,config['epochs']+1):
+        losses = []
+        for phase, loader in enumerate(loaders):
+            model.train(phase==0)
+            total, count = 0., 0
+            with torch.set_grad_enabled(phase==0):
+                for (x,) in loader:
+                    x = x.to(device)
+                    pred, _ = model(x)
+                    loss = ((pred-x)**2).mean() + config['mae_weight']*(pred-x).abs().mean()
+                    if not torch.isfinite(loss):
+                        raise ValueError('Nonfinite training loss')
+                    if phase==0:
+                        optimizer.zero_grad(set_to_none=True); loss.backward(); optimizer.step()
+                    total += loss.item()*len(x); count += len(x)
+            losses.append(total/count)
+        history.append(dict(epoch=epoch, train_loss=losses[0], validation_loss=losses[1]))
+        if losses[1] < best:
+            best, best_epoch = losses[1], epoch
+            torch.save(model.state_dict(), path/'best.pt')
+        pd.DataFrame(history).to_csv(path/'history.csv', index=False)
+        if epoch==1 or epoch%10==0:
+            print(f'{name}, dim={dim}, epoch={epoch}/{config["epochs"]}, train={losses[0]:.6f}, val={losses[1]:.6f}', flush=True)
+    model.load_state_dict(torch.load(path/'best.pt', map_location=device, weights_only=True))
+    model.eval()
+    return model, best_epoch
+
+
+def evaluate(predict, x, ids, raw, lo, scale, frames, path, split):
+    rows = []
+    for i in ids:
+        target = np.asarray(x[i], dtype='float64')
+        pred = np.asarray(predict(np.asarray(x[i:i+1]))[0], dtype='float64')
+        if not np.isfinite(pred).all():
+            raise ValueError('Nonfinite prediction')
+        error = pred-target
+        physical = pred*scale[i,:,None,None]+lo[i,:,None,None]
+        # A constant original slice is reconstructed from its stored minimum.
+        constant = np.ptp(raw[i], axis=(1,2)) == 0
+        physical[constant] = lo[i,constant,None,None]
+        pe = physical-np.asarray(raw[i], dtype='float64')
+        rows.append(dict(frame=int(i), day=frames.iloc[i].day, split=split,
+                         mse=float(np.mean(error**2)), mae=float(np.abs(error).mean()),
+                         relative_l2=float(np.linalg.norm(error)/(np.linalg.norm(target)+1e-12)),
+                         ssim=compute_ssim(target,pred,data_range=1),
+                         physical_mse=float(np.mean(pe**2)), physical_mae=float(np.abs(pe).mean()),
+                         physical_relative_l2=float(np.linalg.norm(pe)/(np.linalg.norm(raw[i])+1e-12))))
+    table = pd.DataFrame(rows)
+    table.to_csv(path/f'{split}_per_frame.csv',index=False)
+    table.groupby('day')[['mse','mae','relative_l2','ssim','physical_mse','physical_mae','physical_relative_l2']].mean().to_csv(path/f'{split}_per_day.csv')
+    result = table.drop(columns=['frame','day','split']).mean().to_dict()
+    result['rmse'] = float(np.sqrt(result['mse']))
+    result['physical_rmse'] = float(np.sqrt(result['physical_mse']))
+    return result
+
+
+def run_experiments(x, raw, lo, scale, frames, splits, counts, config, output):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print('Device:', device, '; runs:', len(counts)*len(config['latent_dims'])*len(config['seeds'])*4, flush=True)
+    rows = []
+    methods = ['DCT','PCA','PlainConv3DAutoencoder','Conv3DAutoencoder']
+    for n in counts:
+        train = np.asarray(x[splits[f'train_{n}']])
+        val = np.asarray(x[splits['validation']])
+        for dim in config['latent_dims']:
+            if dim > min(len(train),int(np.prod(x.shape[1:]))):
+                raise ValueError(f'PCA dim={dim} exceeds train rank bound {len(train)}; reduce latent_dims or increase smallest subset.')
+            for seed in config['seeds']:
+                for name in methods:
+                    path = output / f'{name}_d{dim}_days{n}_seed{seed}'
+                    path.mkdir(exist_ok=True)
+                    completed = path/'results.json'
+                    if completed.exists():
+                        rows.extend(json.loads(completed.read_text())); continue
+                    seed_all(seed)
+                    start = time.perf_counter()
+                    best_epoch, params = None, 0
+                    model = None
+                    if name=='DCT':
+                        model = DCTCompressor(dim).fit(train,verbose=False)
+                        predict = lambda a: model.reconstruct(model.transform(a))
+                        payload_bytes = dim*16  # Existing implementation: float64 + int64 index.
+                    elif name=='PCA':
+                        model = PCA(n_components=dim, svd_solver='randomized', random_state=seed).fit(train.reshape(len(train),-1))
+                        predict = lambda a: model.inverse_transform(model.transform(a.reshape(len(a),-1))).reshape(a.shape)
+                        payload_bytes = dim*4
+                    else:
+                        model, best_epoch = fit_ae(name,dim,train,val,config,path,device)
+                        params = sum(p.numel() for p in model.parameters())
+                        def predict(a):
+                            with torch.no_grad():
+                                return model(torch.from_numpy(np.array(a,dtype='float32'))[:,None].to(device))[0][:,0].cpu().numpy()
+                        payload_bytes = dim*4
+                    if device.type=='cuda':
+                        torch.cuda.synchronize()
+                    fit_seconds = time.perf_counter()-start
+                    run_rows = []
+                    for split, ids in [('train',splits[f'train_{n}']),('validation',splits['validation']),('test',splits['test'])]:
+                        result = evaluate(predict,x,ids,raw,lo,scale,frames,path,split)
+                        result.update(method=name, latent_dim=dim, train_days=n, train_frames=len(train),
+                                      seed=seed, split=split, evaluation_frames=len(ids), best_epoch=best_epoch,
+                                      epochs=config['epochs'] if 'Autoencoder' in name else 0,
+                                      fit_seconds=fit_seconds, parameters=params,
+                                      payload_bytes=payload_bytes, scaling_bytes_per_frame=x.shape[1]*2*4)
+                        run_rows.append(result)
+                    completed.write_text(json.dumps(run_rows,indent=2))
+                    rows.extend(run_rows)
+                    pd.DataFrame(rows).to_csv(output/'metrics_all_runs.csv',index=False)
+                    print('Completed:',path.name, flush=True)
+                    del predict, model
+                    gc.collect()
+                    if device.type=='cuda': torch.cuda.empty_cache()
+    table = pd.DataFrame(rows)
+    table.to_csv(output/'metrics_all_runs.csv',index=False)
+    return table
+
+
+def experiment_directory(root, config, files):
+    protocol = {'config':config, 'files':[{'path':str(p),'bytes':p.stat().st_size,'mtime_ns':p.stat().st_mtime_ns} for p in files],
+                'code':{str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in
+                        [Path(__file__),root/'src/models.py',root/'src/dct.py',root/'src/metrics.py']},
+                'versions':{'torch':torch.__version__,'numpy':np.__version__,'netCDF4':nc.__version__}}
+    key = hashlib.sha256(json.dumps(protocol,sort_keys=True).encode()).hexdigest()[:12]
+    output = root/'outputs'/f'cams_learning_curve_{key}'
+    output.mkdir(parents=True,exist_ok=True)
+    (output/'protocol.json').write_text(json.dumps(protocol,indent=2))
+    return output
