@@ -64,21 +64,21 @@ def coordinate(ds, kind):
 
 def infer_single_level(path, ds, variable):
     """Read a height stored in metadata/filename when the file has no level axis."""
-    texts = [path.name]
-    texts.extend(str(getattr(ds, name)) for name in ds.ncattrs())
-    texts.extend(str(getattr(variable, name)) for name in variable.ncattrs())
-    joined = ' | '.join(texts)
-    if re.search(r'\bsurface\b', joined, flags=re.I):
-        return 0.0
     patterns = [
         r'(?:^|[._-])L(?:EVEL)?[_-]?(\d{1,4})(?:m)?(?:[._-]|$)',
         r'\b(?:height|level|at)\D{0,20}(\d{1,4})\s*m(?:etre)?s?\b',
     ]
-    matches = {float(value) for pattern in patterns
-               for value in re.findall(pattern, joined, flags=re.I)}
-    valid = matches.intersection({0., 50., 100., 250., 500., 750., 1000., 2000., 3000., 5000.})
-    if len(valid) == 1:
-        return valid.pop()
+    allowed = {0., 50., 100., 250., 500., 750., 1000., 2000., 3000., 5000.}
+    # The ADS filename is the most specific source. Some generic metadata can
+    # still contain the word "surface" even for an elevated requested level.
+    for text in [path.name, ' | '.join(str(getattr(ds, name)) for name in ds.ncattrs()),
+                 ' | '.join(str(getattr(variable, name)) for name in variable.ncattrs())]:
+        matches = {float(value) for pattern in patterns
+                   for value in re.findall(pattern, text, flags=re.I)}.intersection(allowed)
+        if len(matches) == 1:
+            return matches.pop()
+        if not matches and re.search(r'\bsurface\b', text, flags=re.I):
+            return 0.0
     raise ValueError(
         f'{path.name}: CO has no level dimension and its height could not be identified. '
         f'Filename/metadata must contain Surface or L0/L50/.../L5000. Global attributes: '
@@ -186,6 +186,8 @@ def prepare(records, reference, config, output):
     tid, zid = {t:i for i,t in enumerate(stamps)}, {z:i for i,z in enumerate(levels)}
     shape = (len(stamps), len(levels), h, w)
     seen = np.zeros(shape[:2], bool)
+    sources = np.full(shape[:2], '', dtype=object)
+    duplicate_files = set()
     raw = np.lib.format.open_memmap(output/'co_physical.npy', mode='w+', dtype='float32', shape=shape)
     for record in records:
         with nc.Dataset(record['path']) as ds:
@@ -202,13 +204,25 @@ def prepare(records, reference, config, output):
                     block = block[None]
                 i = tid[stamp]
                 zz = [zid[float(z)] for z in record['levels']]
-                if seen[i, zz].any():
-                    raise ValueError(f'Duplicate time/height: {stamp}; remove overlapping input files.')
                 if not np.isfinite(block).all():
                     raise ValueError(f'Missing/nonfinite CO at {stamp}; inspect input before training.')
-                raw[i, zz] = block
-                seen[i, zz] = True
+                for local_z, global_z in enumerate(zz):
+                    if seen[i, global_z]:
+                        previous = sources[i, global_z]
+                        if np.array_equal(np.asarray(raw[i, global_z]), block[local_z]):
+                            duplicate_files.add((previous, record['path'].name))
+                            continue
+                        raise ValueError(
+                            f'Conflicting duplicate at time={stamp}, level={levels[global_z]}: '
+                            f'{previous} and {record["path"].name}. Move one product/archive '
+                            'out of the configured data directory.'
+                        )
+                    raw[i, global_z] = block[local_z]
+                    seen[i, global_z] = True
+                    sources[i, global_z] = record['path'].name
         print('Prepared:', record['path'].name, flush=True)
+    for first, duplicate in sorted(duplicate_files):
+        print(f'Ignored identical duplicate: {duplicate} (same data as {first})', flush=True)
     if not seen.all():
         raise ValueError('Some timestamps lack heights. Download matching height/time coverage.')
     raw.flush()
