@@ -100,7 +100,11 @@ def canonical_unit(value, kind):
 
 
 def same_grid(left, right):
-    return left.shape == right.shape and np.allclose(left, right, rtol=0, atol=1e-6)
+    # CAMS files may encode the same nominal 0.1-degree grid as float32 or
+    # float64. Their accumulated representation error is a few microdegrees;
+    # 1e-4 degrees remains far below one grid cell and still rejects the
+    # historical 0.05-degree grid shift.
+    return left.shape == right.shape and np.allclose(left, right, rtol=0, atol=1e-4)
 
 
 def inspect_files(files, variable=None):
