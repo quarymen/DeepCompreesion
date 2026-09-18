@@ -352,9 +352,12 @@ def fit_ae(name, dim, train, val, config, path, device):
     return model, best_epoch
 
 
-def evaluate(predict, x, ids, raw, lo, scale, frames, path, split):
+def evaluate(predict, x, ids, raw, lo, scale, frames, path, split, run_label=''):
     rows = []
-    for i in ids:
+    total = len(ids)
+    print(f'  Evaluating {split}: {total} frames', flush=True)
+    progress_step = max(1, min(100, total // 10))
+    for position, i in enumerate(ids, start=1):
         target = np.asarray(x[i], dtype='float64')
         pred = np.asarray(predict(np.asarray(x[i:i+1]))[0], dtype='float64')
         if not np.isfinite(pred).all():
@@ -371,6 +374,8 @@ def evaluate(predict, x, ids, raw, lo, scale, frames, path, split):
                          ssim=compute_ssim(target,pred,data_range=1),
                          physical_mse=float(np.mean(pe**2)), physical_mae=float(np.abs(pe).mean()),
                          physical_relative_l2=float(np.linalg.norm(pe)/(np.linalg.norm(raw[i])+1e-12))))
+        if position == total or position % progress_step == 0:
+            print(f'    {run_label} {split}: {position}/{total} frames', flush=True)
     table = pd.DataFrame(rows)
     table.to_csv(path/f'{split}_per_frame.csv',index=False)
     table.groupby('day')[['mse','mae','relative_l2','ssim','physical_mse','physical_mae','physical_relative_l2']].mean().to_csv(path/f'{split}_per_day.csv')
@@ -385,6 +390,8 @@ def run_experiments(x, raw, lo, scale, frames, splits, counts, config, output):
     print('Device:', device, '; runs:', len(counts)*len(config['latent_dims'])*len(config['seeds'])*4, flush=True)
     rows = []
     methods = ['DCT','PCA','PlainConv3DAutoencoder','Conv3DAutoencoder']
+    total_runs = len(counts)*len(config['latent_dims'])*len(config['seeds'])*len(methods)
+    run_number = 0
     for n in counts:
         train = np.asarray(x[splits[f'train_{n}']])
         val = np.asarray(x[splits['validation']])
@@ -393,24 +400,31 @@ def run_experiments(x, raw, lo, scale, frames, splits, counts, config, output):
                 raise ValueError(f'PCA dim={dim} exceeds train rank bound {len(train)}; reduce latent_dims or increase smallest subset.')
             for seed in config['seeds']:
                 for name in methods:
+                    run_number += 1
                     path = output / f'{name}_d{dim}_days{n}_seed{seed}'
                     path.mkdir(exist_ok=True)
                     completed = path/'results.json'
                     if completed.exists():
+                        print(f'[{run_number}/{total_runs}] Reusing completed {path.name}', flush=True)
                         rows.extend(json.loads(completed.read_text())); continue
+                    print(f'[{run_number}/{total_runs}] Starting {path.name}: '
+                          f'{len(train)} train frames, {len(val)} validation frames', flush=True)
                     seed_all(seed)
                     start = time.perf_counter()
                     best_epoch, params = None, 0
                     model = None
                     if name=='DCT':
+                        print('  Fitting DCT baseline', flush=True)
                         model = DCTCompressor(dim).fit(train,verbose=False)
                         predict = lambda a: model.reconstruct(model.transform(a))
                         payload_bytes = dim*16  # Existing implementation: float64 + int64 index.
                     elif name=='PCA':
+                        print('  Fitting PCA baseline', flush=True)
                         model = PCA(n_components=dim, svd_solver='randomized', random_state=seed).fit(train.reshape(len(train),-1))
                         predict = lambda a: model.inverse_transform(model.transform(a.reshape(len(a),-1))).reshape(a.shape)
                         payload_bytes = dim*4
                     else:
+                        print(f'  Training neural network for {config["epochs"]} epochs', flush=True)
                         model, best_epoch = fit_ae(name,dim,train,val,config,path,device)
                         params = sum(p.numel() for p in model.parameters())
                         def predict(a):
@@ -420,9 +434,11 @@ def run_experiments(x, raw, lo, scale, frames, splits, counts, config, output):
                     if device.type=='cuda':
                         torch.cuda.synchronize()
                     fit_seconds = time.perf_counter()-start
+                    print(f'  Fit completed in {fit_seconds:.1f} s', flush=True)
                     run_rows = []
                     for split, ids in [('train',splits[f'train_{n}']),('validation',splits['validation']),('test',splits['test'])]:
-                        result = evaluate(predict,x,ids,raw,lo,scale,frames,path,split)
+                        result = evaluate(predict,x,ids,raw,lo,scale,frames,path,split,
+                                          run_label=path.name)
                         result.update(method=name, latent_dim=dim, train_days=n, train_frames=len(train),
                                       seed=seed, split=split, evaluation_frames=len(ids), best_epoch=best_epoch,
                                       epochs=config['epochs'] if 'Autoencoder' in name else 0,
