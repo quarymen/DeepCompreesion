@@ -412,7 +412,11 @@ def run_experiments(x, raw, lo, scale, frames, splits, counts, config, output):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print('Device:', device, '; runs:', len(counts)*len(config['latent_dims'])*len(config['seeds'])*4, flush=True)
     rows = []
-    methods = ['DCT','PCA','PlainConv3DAutoencoder','Conv3DAutoencoder']
+    methods = config.get('methods', ['DCT','PCA','PlainConv3DAutoencoder','Conv3DAutoencoder'])
+    allowed_methods = {'DCT','PCA','PlainConv3DAutoencoder','Conv3DAutoencoder'}
+    unknown_methods = set(methods) - allowed_methods
+    if unknown_methods:
+        raise ValueError(f'Unknown methods: {sorted(unknown_methods)}')
     total_runs = len(counts)*len(config['latent_dims'])*len(config['seeds'])*len(methods)
     run_number = 0
     for n in counts:
