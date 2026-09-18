@@ -86,6 +86,23 @@ def infer_single_level(path, ds, variable):
     )
 
 
+def canonical_unit(value, kind):
+    """Canonicalise common CAMS spellings without converting numerical data."""
+    text = str(value).strip().lower().replace('μ', 'u').replace('µ', 'u')
+    text = re.sub(r'[\s{}^*/_]', '', text)
+    if kind == 'co' and text in {'ugm-3', 'ugm3-1', 'ugm3'}:
+        return 'ug m-3'
+    if kind == 'level' and text in {'m', 'meter', 'meters', 'metre', 'metres',
+                                     'mabovesurface', 'metersabovesurface',
+                                     'metresabovesurface'}:
+        return 'm above surface'
+    return text
+
+
+def same_grid(left, right):
+    return left.shape == right.shape and np.allclose(left, right, rtol=0, atol=1e-6)
+
+
 def inspect_files(files, variable=None):
     records, rows = [], []
     reference = None
@@ -117,18 +134,36 @@ def inspect_files(files, variable=None):
                 levels = np.asarray(cv['level'][:]).reshape(-1).astype(float)
                 level_units = getattr(cv['level'], 'units', 'UNKNOWN')
             lat, lon = (np.asarray(cv[k][:]) for k in ['lat', 'lon'])
-            units = getattr(v, 'units', 'UNKNOWN')
+            units_original = getattr(v, 'units', 'UNKNOWN')
+            units = canonical_unit(units_original, 'co')
+            level_units = canonical_unit(level_units, 'level')
             if reference is None:
                 reference = (lat, lon, units, level_units)
-            if not (np.array_equal(lat, reference[0]) and np.array_equal(lon, reference[1])
-                    and (units, level_units) == reference[2:]):
-                raise ValueError('Files have different grids or units; do not mix products.')
+            differences = []
+            if not same_grid(lat, reference[0]):
+                differences.append(f'latitude shape/range={lat.shape}/{float(lat.min())}..{float(lat.max())}')
+            if not same_grid(lon, reference[1]):
+                differences.append(f'longitude shape/range={lon.shape}/{float(lon.min())}..{float(lon.max())}')
+            if units != reference[2]:
+                differences.append(f'CO units={units_original!r} (canonical {units!r})')
+            if level_units != reference[3]:
+                differences.append(f'level units={level_units!r}')
+            if differences:
+                raise ValueError(
+                    f'{path.name} differs from the first file {files[0].name}: '
+                    + '; '.join(differences)
+                    + f'. Reference grid: latitude {reference[0].shape}/'
+                      f'{float(reference[0].min())}..{float(reference[0].max())}, longitude '
+                      f'{reference[1].shape}/{float(reference[1].min())}..{float(reference[1].max())}, '
+                      f'units={reference[2]!r}, level_units={reference[3]!r}. '
+                      'Keep only one CAMS product/grid in the data directory.'
+                )
             tv = cv['time']
             dates = nc.num2date(tv[:], tv.units, calendar=getattr(tv, 'calendar', 'standard'))
             dates = [d.isoformat() for d in dates]
             rows.append(dict(file=path.name, variable=name, shape=str(v.shape),
                              dimensions=str(v.dimensions), frames=len(dates),
-                             levels=levels.tolist(), units=units, first=dates[0], last=dates[-1],
+                             levels=levels.tolist(), units=units_original, first=dates[0], last=dates[-1],
                              disk_GiB=path.stat().st_size / 2**30))
             records.append(dict(path=path, variable=name, dims=dims, axes=v.dimensions,
                                 dates=dates, levels=levels))
