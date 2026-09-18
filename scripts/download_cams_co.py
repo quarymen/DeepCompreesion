@@ -34,13 +34,13 @@ def month_index(value):
     return year * 12 + month - 1
 
 
-def monthly_requests(start, end):
-    for index in range(start, end + 1):
+def monthly_requests(indices, levels=LEVELS):
+    for index in indices:
         year, month = divmod(index, 12)
         yield {
             "variable": ["carbon_monoxide"],
             "model": ["ensemble"],
-            "level": LEVELS.copy(),
+            "level": list(levels),
             "type": ["validated_reanalysis"],
             "year": [str(year)],
             "month": [f"{month + 1:02d}"],
@@ -87,7 +87,7 @@ def download_month(client, request, output):
     partial = stem.with_suffix(".part")
     # An interrupted month is downloaded again; completed months are retained.
     partial.unlink(missing_ok=True)
-    print(f"Downloading {label} (all Europe, 10 heights)...", flush=True)
+    print(f"Downloading {label} (all Europe, {len(request['level'])} heights)...", flush=True)
     client.retrieve(DATASET, request, str(partial))
     target = stem.with_suffix(file_format(partial))
     partial.replace(target)
@@ -101,14 +101,26 @@ def download_month(client, request, output):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--start", type=month_index, required=True, help="First month YYYY-MM")
-    parser.add_argument("--end", type=month_index, required=True, help="Last month YYYY-MM, inclusive")
+    parser.add_argument("--start", type=month_index, help="First month YYYY-MM")
+    parser.add_argument("--end", type=month_index, help="Last month YYYY-MM, inclusive")
+    parser.add_argument("--months", nargs="+", type=month_index,
+                        help="Selected months YYYY-MM; alternative to --start/--end")
+    parser.add_argument("--levels", nargs="+", choices=LEVELS, default=LEVELS,
+                        help="Heights in metres (default: all ten)")
     parser.add_argument("--output-dir", type=Path, default=Path("data/cams_co"))
     parser.add_argument("--dry-run", action="store_true", help="Print requests without login or download")
     args = parser.parse_args()
-    if args.end < args.start:
-        parser.error("--end must be >= --start")
-    requests = list(monthly_requests(args.start, args.end))
+    if args.months:
+        if args.start is not None or args.end is not None:
+            parser.error("Use either --months or --start/--end")
+        indices = sorted(set(args.months))
+    else:
+        if args.start is None or args.end is None:
+            parser.error("Provide both --start and --end, or use --months")
+        if args.end < args.start:
+            parser.error("--end must be >= --start")
+        indices = range(args.start, args.end + 1)
+    requests = list(monthly_requests(indices, args.levels))
     if args.dry_run:
         print(json.dumps({"dataset": DATASET, "requests": requests}, indent=2))
         return

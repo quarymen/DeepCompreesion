@@ -7,6 +7,7 @@ import random
 import shutil
 import time
 import zipfile
+import re
 
 import netCDF4 as nc
 import numpy as np
@@ -61,6 +62,30 @@ def coordinate(ds, kind):
     raise ValueError(f'Cannot identify {kind}: {list(ds.variables)}')
 
 
+def infer_single_level(path, ds, variable):
+    """Read a height stored in metadata/filename when the file has no level axis."""
+    texts = [path.name]
+    texts.extend(str(getattr(ds, name)) for name in ds.ncattrs())
+    texts.extend(str(getattr(variable, name)) for name in variable.ncattrs())
+    joined = ' | '.join(texts)
+    if re.search(r'\bsurface\b', joined, flags=re.I):
+        return 0.0
+    patterns = [
+        r'(?:^|[._-])L(?:EVEL)?[_-]?(\d{1,4})(?:m)?(?:[._-]|$)',
+        r'\b(?:height|level|at)\D{0,20}(\d{1,4})\s*m(?:etre)?s?\b',
+    ]
+    matches = {float(value) for pattern in patterns
+               for value in re.findall(pattern, joined, flags=re.I)}
+    valid = matches.intersection({0., 50., 100., 250., 500., 750., 1000., 2000., 3000., 5000.})
+    if len(valid) == 1:
+        return valid.pop()
+    raise ValueError(
+        f'{path.name}: CO has no level dimension and its height could not be identified. '
+        f'Filename/metadata must contain Surface or L0/L50/.../L5000. Global attributes: '
+        f'{dict((name, getattr(ds, name)) for name in ds.ncattrs())}'
+    )
+
+
 def inspect_files(files, variable=None):
     records, rows = [], []
     reference = None
@@ -73,18 +98,26 @@ def inspect_files(files, variable=None):
             if name not in ds.variables:
                 raise ValueError(f'{path.name}: set VARIABLE explicitly; variables={list(ds.variables)}')
             v = ds[name]
-            coords = {k: coordinate(ds, k) for k in ['time', 'level', 'lat', 'lon']}
-            cv = {k: ds[n] for k, n in coords.items()}
+            coords = {k: coordinate(ds, k) for k in ['time', 'lat', 'lon']}
+            try:
+                coords['level'] = coordinate(ds, 'level')
+            except ValueError:
+                coords['level'] = None
+            cv = {k: ds[n] for k, n in coords.items() if n is not None}
             dims = {k: x.dimensions[0] for k, x in cv.items() if x.ndim == 1}
             expected = [dims[k] for k in ['time', 'lat', 'lon']]
             if 'level' in dims:
                 expected.append(dims['level'])
             if set(expected) != set(v.dimensions):
                 raise ValueError(f'Unsupported CO dimensions {v.dimensions}, coordinates {dims}')
-            levels = np.asarray(cv['level'][:]).reshape(-1).astype(float)
+            if coords['level'] is None:
+                levels = np.array([infer_single_level(path, ds, v)])
+                level_units = 'm above surface'
+            else:
+                levels = np.asarray(cv['level'][:]).reshape(-1).astype(float)
+                level_units = getattr(cv['level'], 'units', 'UNKNOWN')
             lat, lon = (np.asarray(cv[k][:]) for k in ['lat', 'lon'])
             units = getattr(v, 'units', 'UNKNOWN')
-            level_units = getattr(cv['level'], 'units', 'UNKNOWN')
             if reference is None:
                 reference = (lat, lon, units, level_units)
             if not (np.array_equal(lat, reference[0]) and np.array_equal(lon, reference[1])
