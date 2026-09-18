@@ -251,10 +251,14 @@ def split_days(frames, config, output):
     days = sorted(frames.day.unique())
     years = config.get('split_years')
     if years:
-        if len(set(years.values())) != 3:
-            raise ValueError('split_years must contain three different years.')
+        train_years = years['train'] if isinstance(years['train'], list) else [years['train']]
+        train_years = [int(year) for year in train_years]
+        validation_year = int(years['validation'])
+        test_year = int(years['test'])
+        if len(set(train_years + [validation_year, test_year])) != len(train_years) + 2:
+            raise ValueError('Training, validation and test years must be different.')
         per_month = int(config.get('evaluation_days_per_month', 7))
-        train_days = [d for d in days if pd.Timestamp(d).year == years['train']]
+        train_days = [d for d in days if pd.Timestamp(d).year in train_years]
         def evaluation_days(year):
             candidates = [d for d in days if pd.Timestamp(d).year == year]
             selected = []
@@ -265,8 +269,8 @@ def split_days(frames, config, output):
                 positions = np.linspace(0, len(group)-1, per_month).round().astype(int)
                 selected.extend(group[i] for i in positions)
             return selected
-        val_days = evaluation_days(years['validation'])
-        test_days = evaluation_days(years['test'])
+        val_days = evaluation_days(validation_year)
+        test_days = evaluation_days(test_year)
     else:
         ntest, nval = max(2, round(len(days)*.16)), max(2, round(len(days)*.16))
         gap = config['gap_days']
