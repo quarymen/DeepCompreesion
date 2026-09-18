@@ -200,22 +200,52 @@ def prepare(records, reference, config, output):
 
 def split_days(frames, config, output):
     days = sorted(frames.day.unique())
-    ntest, nval = max(2, round(len(days)*.16)), max(2, round(len(days)*.16))
-    gap = config['gap_days']
-    test_start = pd.Timestamp(days[-ntest])
-    before_test = [d for d in days if pd.Timestamp(d) < test_start-pd.Timedelta(days=gap)]
-    val_days = before_test[-nval:]
-    if len(val_days) != nval:
-        raise ValueError('Not enough days for validation.')
-    val_start = pd.Timestamp(val_days[0])
-    train_days = [d for d in before_test if pd.Timestamp(d) < val_start-pd.Timedelta(days=gap)]
+    years = config.get('split_years')
+    if years:
+        if len(set(years.values())) != 3:
+            raise ValueError('split_years must contain three different years.')
+        per_month = int(config.get('evaluation_days_per_month', 7))
+        train_days = [d for d in days if pd.Timestamp(d).year == years['train']]
+        def evaluation_days(year):
+            candidates = [d for d in days if pd.Timestamp(d).year == year]
+            selected = []
+            for month in sorted({pd.Timestamp(d).month for d in candidates}):
+                group = [d for d in candidates if pd.Timestamp(d).month == month]
+                if len(group) < per_month:
+                    raise ValueError(f'Only {len(group)} days available for {year}-{month:02d}.')
+                positions = np.linspace(0, len(group)-1, per_month).round().astype(int)
+                selected.extend(group[i] for i in positions)
+            return selected
+        val_days = evaluation_days(years['validation'])
+        test_days = evaluation_days(years['test'])
+    else:
+        ntest, nval = max(2, round(len(days)*.16)), max(2, round(len(days)*.16))
+        gap = config['gap_days']
+        test_start = pd.Timestamp(days[-ntest])
+        before_test = [d for d in days if pd.Timestamp(d) < test_start-pd.Timedelta(days=gap)]
+        val_days = before_test[-nval:]
+        if len(val_days) != nval:
+            raise ValueError('Not enough days for validation.')
+        val_start = pd.Timestamp(val_days[0])
+        train_days = [d for d in before_test if pd.Timestamp(d) < val_start-pd.Timedelta(days=gap)]
+        test_days = days[-ntest:]
     if len(train_days) < 2:
         raise ValueError('Need more days for train/validation/test with gaps.')
     counts = sorted(set([n for n in config['train_day_counts'] if n <= len(train_days)] + [len(train_days)]))
-    # Nested, reproducible subsets of days; separate from model random seeds.
-    order = np.random.default_rng(config['subset_seed']).permutation(train_days).tolist()
+    # Nested, reproducible subsets, interleaved across months when a full year is used.
+    rng = np.random.default_rng(config['subset_seed'])
+    buckets = {}
+    for day in train_days:
+        buckets.setdefault(pd.Timestamp(day).month, []).append(day)
+    for month in buckets:
+        buckets[month] = rng.permutation(buckets[month]).tolist()
+    order = []
+    while any(buckets.values()):
+        for month in sorted(buckets):
+            if buckets[month]:
+                order.append(buckets[month].pop())
     ids = lambda ds: np.flatnonzero(frames.day.isin(ds).to_numpy())
-    splits = {'validation': ids(val_days), 'test': ids(days[-ntest:])}
+    splits = {'validation': ids(val_days), 'test': ids(test_days)}
     splits.update({f'train_{n}':ids(order[:n]) for n in counts})
     for n in counts:
         assert not set(splits[f'train_{n}']) & set(splits['validation'])
