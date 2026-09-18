@@ -375,13 +375,32 @@ def evaluate(predict, x, ids, raw, lo, scale, frames, path, split, run_label='')
                          physical_mse=float(np.mean(pe**2)), physical_mae=float(np.abs(pe).mean()),
                          physical_relative_l2=float(np.linalg.norm(pe)/(np.linalg.norm(raw[i])+1e-12))))
         if position == total or position % progress_step == 0:
-            print(f'    {run_label} {split}: {position}/{total} frames', flush=True)
+            partial = rows
+            running_mse = float(np.mean([row['mse'] for row in partial]))
+            running_l2 = float(np.mean([row['relative_l2'] for row in partial]))
+            running_ssim = float(np.mean([row['ssim'] for row in partial]))
+            running_physical_rmse = float(np.sqrt(np.mean(
+                [row['physical_mse'] for row in partial]
+            )))
+            print(
+                f'    {run_label} {split}: {position}/{total} frames | '
+                f'MSE={running_mse:.6g}, RMSE={np.sqrt(running_mse):.6g}, '
+                f'relL2={running_l2:.6g}, SSIM={running_ssim:.6g}, '
+                f'physical_RMSE={running_physical_rmse:.6g}',
+                flush=True,
+            )
     table = pd.DataFrame(rows)
     table.to_csv(path/f'{split}_per_frame.csv',index=False)
     table.groupby('day')[['mse','mae','relative_l2','ssim','physical_mse','physical_mae','physical_relative_l2']].mean().to_csv(path/f'{split}_per_day.csv')
     result = table.drop(columns=['frame','day','split']).mean().to_dict()
     result['rmse'] = float(np.sqrt(result['mse']))
     result['physical_rmse'] = float(np.sqrt(result['physical_mse']))
+    print(
+        f'  {split} final: MSE={result["mse"]:.6g}, RMSE={result["rmse"]:.6g}, '
+        f'MAE={result["mae"]:.6g}, relL2={result["relative_l2"]:.6g}, '
+        f'SSIM={result["ssim"]:.6g}, physical_RMSE={result["physical_rmse"]:.6g}',
+        flush=True,
+    )
     return result
 
 
