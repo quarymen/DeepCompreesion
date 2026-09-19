@@ -21,11 +21,20 @@ from src.dct import DCTCompressor
 from src.metrics import compute_ssim
 
 
-def unpack(folder):
+def unpack(folder, selected_levels=None):
     """Stream archives to disk; atomically mark successful extraction."""
     folder = Path(folder)
+    selected = ({str(int(level)) for level in selected_levels}
+                if selected_levels is not None else None)
     files = list(folder.glob('*.nc')) + list(folder.glob('*.nc4'))
     for archive in sorted(folder.glob('*.zip')):
+        manifest = archive.with_suffix('.json')
+        if selected is not None and manifest.exists():
+            metadata = json.loads(manifest.read_text())
+            archive_levels = set(metadata.get('request', {}).get('level', []))
+            if archive_levels and archive_levels.isdisjoint(selected):
+                print(f'Skipping archive outside selected levels: {archive.name}', flush=True)
+                continue
         dest = folder / 'unpacked' / archive.stem
         signature = f'{archive.stat().st_size}:{archive.stat().st_mtime_ns}'
         marker = dest / '.complete'
@@ -107,9 +116,12 @@ def same_grid(left, right):
     return left.shape == right.shape and np.allclose(left, right, rtol=0, atol=1e-4)
 
 
-def inspect_files(files, variable=None):
+def inspect_files(files, variable=None, selected_levels=None):
     records, rows = [], []
     reference = None
+    reference_path = None
+    selected = ({float(level) for level in selected_levels}
+                if selected_levels is not None else None)
     for path in files:
         with nc.Dataset(path) as ds:
             candidates = [n for n, v in ds.variables.items() if v.ndim >= 3 and
@@ -137,12 +149,19 @@ def inspect_files(files, variable=None):
             else:
                 levels = np.asarray(cv['level'][:]).reshape(-1).astype(float)
                 level_units = getattr(cv['level'], 'units', 'UNKNOWN')
+            level_indices = [i for i, level in enumerate(levels)
+                             if selected is None or float(level) in selected]
+            if not level_indices:
+                print(f'Skipping file outside selected levels: {path.name}', flush=True)
+                continue
+            levels = levels[level_indices]
             lat, lon = (np.asarray(cv[k][:]) for k in ['lat', 'lon'])
             units_original = getattr(v, 'units', 'UNKNOWN')
             units = canonical_unit(units_original, 'co')
             level_units = canonical_unit(level_units, 'level')
             if reference is None:
                 reference = (lat, lon, units, level_units)
+                reference_path = path
             differences = []
             if not same_grid(lat, reference[0]):
                 differences.append(f'latitude shape/range={lat.shape}/{float(lat.min())}..{float(lat.max())}')
@@ -154,7 +173,7 @@ def inspect_files(files, variable=None):
                 differences.append(f'level units={level_units!r}')
             if differences:
                 raise ValueError(
-                    f'{path.name} differs from the first file {files[0].name}: '
+                    f'{path.name} differs from the first selected file {reference_path.name}: '
                     + '; '.join(differences)
                     + f'. Reference grid: latitude {reference[0].shape}/'
                       f'{float(reference[0].min())}..{float(reference[0].max())}, longitude '
@@ -170,7 +189,9 @@ def inspect_files(files, variable=None):
                              levels=levels.tolist(), units=units_original, first=dates[0], last=dates[-1],
                              disk_GiB=path.stat().st_size / 2**30))
             records.append(dict(path=path, variable=name, dims=dims, axes=v.dimensions,
-                                dates=dates, levels=levels))
+                                dates=dates, levels=levels, level_indices=level_indices))
+    if not records:
+        raise ValueError(f'No files match selected_levels={selected_levels}')
     inventory = pd.DataFrame(rows)
     return inventory, records, reference
 
@@ -206,6 +227,8 @@ def prepare(records, reference, config, output):
                 block = np.asarray(block.filled(np.nan), dtype='float32').transpose(order)
                 if 'level' not in dims:
                     block = block[None]
+                else:
+                    block = block[record['level_indices']]
                 i = tid[stamp]
                 zz = [zid[float(z)] for z in record['levels']]
                 if not np.isfinite(block).all():
