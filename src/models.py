@@ -44,7 +44,7 @@ class Conv3DAutoencoder(nn.Module):
 
         encoder_layers = []
         
-        # Блок 1 энкодера: (1, 32, 96, 84) -> (32, 16, 48, 42)
+        # Блок 1 энкодера: (1, 32, 96, 84) -> (32, 32, 48, 42)
         encoder_layers.append(nn.Conv3d(self.input_channels, 32, 3, stride=(1, 2, 2), padding=1))
         encoder_layers.append(nn.ReLU())
         if use_attention:
@@ -52,7 +52,7 @@ class Conv3DAutoencoder(nn.Module):
         if dropout_rate > 0:
             encoder_layers.append(nn.Dropout3d(dropout_rate))
         
-        # Блок 2 энкодера: (32, 16, 48, 42) -> (64, 8, 24, 21)
+        # Блок 2 энкодера: (32, 32, 48, 42) -> (64, 32, 24, 21)
         encoder_layers.append(nn.Conv3d(32, 64, 3, stride=(1, 2, 2), padding=1))
         encoder_layers.append(nn.ReLU())
         if use_attention:
@@ -60,7 +60,7 @@ class Conv3DAutoencoder(nn.Module):
         if dropout_rate > 0:
             encoder_layers.append(nn.Dropout3d(dropout_rate))
 
-        # Блок 3 энкодера: (64, 8, 24, 21) -> (128, 4, 12, 11)
+        # Блок 3 энкодера: (64, 32, 24, 21) -> (128, 32, 12, 11)
         encoder_layers.append(nn.Conv3d(64, 128, 3, stride=(1, 2, 2), padding=1))
         encoder_layers.append(nn.ReLU())
         if use_attention:
@@ -79,27 +79,58 @@ class Conv3DAutoencoder(nn.Module):
         
         self.fc_encoder = nn.Linear(self.flatten_size, latent_dim)
         self.fc_decoder = nn.Linear(latent_dim, self.flatten_size)
+
+        # For Conv3d(kernel=3, stride=2, padding=1), each spatial size becomes
+        # ceil(size/2). Compute the inverse output_padding for every decoder
+        # stage so that ConvTranspose3d restores the input exactly.
+        spatial_sizes = [(self.input_height, self.input_width)]
+        for _ in range(3):
+            height, width = spatial_sizes[-1]
+            spatial_sizes.append(((height + 1) // 2, (width + 1) // 2))
+
+        def inverse_output_padding(source, target):
+            value = target - (2 * source - 1)
+            if value not in (0, 1):
+                raise ValueError(f"Невозможно восстановить размер {source} -> {target}")
+            return value
+
+        decoder_output_padding = []
+        for source, target in zip(spatial_sizes[:0:-1], spatial_sizes[-2::-1]):
+            decoder_output_padding.append((
+                0,
+                inverse_output_padding(source[0], target[0]),
+                inverse_output_padding(source[1], target[1]),
+            ))
         
         decoder_layers = []
         
-        # Блок 1 декодера: (128, 4, 12, 11) -> (64, 8, 24, 22)
-        decoder_layers.append(nn.ConvTranspose3d(128, 64, 3, stride=(1, 2, 2), padding=1, output_padding=(0, 0, 1)))
+        # Блок 1 декодера: (128, 32, 12, 11) -> (64, 32, 24, 21)
+        decoder_layers.append(nn.ConvTranspose3d(
+            128, 64, 3, stride=(1, 2, 2), padding=1,
+            output_padding=decoder_output_padding[0],
+        ))
         decoder_layers.append(nn.ReLU())
         if use_attention:
             decoder_layers.append(SpatialAttentionModule3D())
         if dropout_rate > 0:
             decoder_layers.append(nn.Dropout3d(dropout_rate))
 
-        # Блок 2 декодера: (64, 8, 24, 22) -> (32, 16, 48, 44)
-        decoder_layers.append(nn.ConvTranspose3d(64, 32, 3, stride=(1, 2, 2), padding=1, output_padding=(0, 0, 0)))
+        # Блок 2 декодера: (64, 32, 24, 21) -> (32, 32, 48, 42)
+        decoder_layers.append(nn.ConvTranspose3d(
+            64, 32, 3, stride=(1, 2, 2), padding=1,
+            output_padding=decoder_output_padding[1],
+        ))
         decoder_layers.append(nn.ReLU())
         if use_attention:
             decoder_layers.append(SpatialAttentionModule3D())
         if dropout_rate > 0:
             decoder_layers.append(nn.Dropout3d(dropout_rate))
 
-        # Блок 3 декодера: (32, 16, 48, 44) -> (1, 32, 96, 88)
-        decoder_layers.append(nn.ConvTranspose3d(32, self.input_channels, 3, stride=(1, 2, 2), padding=1, output_padding=(0, 0, 0)))
+        # Блок 3 декодера: (32, 32, 48, 42) -> (1, 32, 96, 84)
+        decoder_layers.append(nn.ConvTranspose3d(
+            32, self.input_channels, 3, stride=(1, 2, 2), padding=1,
+            output_padding=decoder_output_padding[2],
+        ))
         
         self.decoder_conv = nn.Sequential(*decoder_layers)
         
@@ -116,10 +147,13 @@ class Conv3DAutoencoder(nn.Module):
         x = x.view(x.size(0), *self.encoder_output_shape) 
         
         x = self.decoder_conv(x)
-        
-        # Interpolate до точных размеров
-        x = F.interpolate(x, size=(self.target_depth, self.target_height, self.target_width),
-                          mode='trilinear', align_corners=False)
+
+        expected_shape = (self.input_channels, self.target_depth,
+                          self.target_height, self.target_width)
+        if tuple(x.shape[1:]) != expected_shape:
+            raise RuntimeError(
+                f"Декодер восстановил {tuple(x.shape[1:])}, ожидалось {expected_shape}"
+            )
         
         return x, latent
 
