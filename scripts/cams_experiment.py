@@ -437,14 +437,19 @@ def evaluate(predict, x, ids, raw, lo, scale, frames, path, split, run_label='')
 
 def run_experiments(x, raw, lo, scale, frames, splits, counts, config, output):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print('Device:', device, '; runs:', len(counts)*len(config['latent_dims'])*len(config['seeds'])*4, flush=True)
     rows = []
     methods = config.get('methods', ['DCT','PCA','PlainConv3DAutoencoder','Conv3DAutoencoder'])
     allowed_methods = {'DCT','PCA','PlainConv3DAutoencoder','Conv3DAutoencoder'}
     unknown_methods = set(methods) - allowed_methods
     if unknown_methods:
         raise ValueError(f'Unknown methods: {sorted(unknown_methods)}')
+    evaluation_splits = config.get('evaluation_splits', ['train', 'validation', 'test'])
+    allowed_splits = {'train', 'validation', 'test'}
+    unknown_splits = set(evaluation_splits) - allowed_splits
+    if unknown_splits or not evaluation_splits:
+        raise ValueError(f'Invalid evaluation_splits: {evaluation_splits}')
     total_runs = len(counts)*len(config['latent_dims'])*len(config['seeds'])*len(methods)
+    print('Device:', device, '; runs:', total_runs, flush=True)
     run_number = 0
     for n in counts:
         train = np.asarray(x[splits[f'train_{n}']])
@@ -490,7 +495,13 @@ def run_experiments(x, raw, lo, scale, frames, splits, counts, config, output):
                     fit_seconds = time.perf_counter()-start
                     print(f'  Fit completed in {fit_seconds:.1f} s', flush=True)
                     run_rows = []
-                    for split, ids in [('train',splits[f'train_{n}']),('validation',splits['validation']),('test',splits['test'])]:
+                    split_indices = {
+                        'train': splits[f'train_{n}'],
+                        'validation': splits['validation'],
+                        'test': splits['test'],
+                    }
+                    for split in evaluation_splits:
+                        ids = split_indices[split]
                         result = evaluate(predict,x,ids,raw,lo,scale,frames,path,split,
                                           run_label=path.name)
                         result.update(method=name, latent_dim=dim, train_days=n, train_frames=len(train),
