@@ -336,9 +336,98 @@ class SimpleConv3DAutoencoder(nn.Module):
         return x, latent
 
 
+class MultiscaleSpatialAttention3D(nn.Module):
+    """Identity-initialized spatial gate with two horizontal receptive fields."""
+
+    def __init__(self):
+        super().__init__()
+        self.local = nn.Conv3d(2, 8, (1, 3, 3), padding=(0, 1, 1))
+        self.wide = nn.Conv3d(2, 8, (1, 7, 7), padding=(0, 3, 3))
+        self.activation = nn.LeakyReLU(0.1)
+        self.mask = nn.Conv3d(16, 1, 1)
+        nn.init.zeros_(self.mask.weight)
+        nn.init.zeros_(self.mask.bias)
+
+    def forward(self, x):
+        stats = torch.cat([x.mean(1, keepdim=True), x.amax(1, keepdim=True)], dim=1)
+        features = self.activation(torch.cat([self.local(stats), self.wide(stats)], dim=1))
+        return x * (1 + 0.5 * torch.tanh(self.mask(features)))
+
+
+class FactorizedResidualBlock3D(nn.Module):
+    """Horizontal processing followed by mixing along the height axis."""
+
+    def __init__(self, channels):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Conv3d(channels, channels, (1, 3, 3), padding=(0, 1, 1)),
+            nn.LeakyReLU(0.1),
+            nn.Conv3d(channels, channels, (3, 1, 1), padding=(1, 0, 0)),
+        )
+
+    def forward(self, x):
+        return x + self.layers(x)
+
+
+class ResidualSAM3DAutoencoder(nn.Module):
+    """Single-code residual autoencoder; spatial attention precedes downsampling.
+
+    There are no encoder-to-decoder skips or parallel global reconstruction paths.
+    """
+
+    def __init__(self, latent_dim=64, input_shape=(1, 6, 96, 84), dropout_rate=0.0):
+        super().__init__()
+        if dropout_rate != 0:
+            raise ValueError('ResidualSAM3DAutoencoder expects dropout_rate=0.')
+        self.input_shape = tuple(input_shape)
+        self.latent_dim = latent_dim
+        channels, depth, height, width = self.input_shape
+        sizes = [(height, width)]
+        for _ in range(3):
+            h, w = sizes[-1]
+            sizes.append(((h + 1) // 2, (w + 1) // 2))
+        self.feature_shape = (128, depth, *sizes[-1])
+        self.encoder = nn.Sequential(
+            nn.Conv3d(channels, 32, 3, padding=1), nn.LeakyReLU(0.1),
+            FactorizedResidualBlock3D(32), MultiscaleSpatialAttention3D(),
+            nn.Conv3d(32, 64, 3, stride=(1, 2, 2), padding=1), nn.LeakyReLU(0.1),
+            FactorizedResidualBlock3D(64), MultiscaleSpatialAttention3D(),
+            nn.Conv3d(64, 128, 3, stride=(1, 2, 2), padding=1), nn.LeakyReLU(0.1),
+            FactorizedResidualBlock3D(128),
+            nn.Conv3d(128, 128, 3, stride=(1, 2, 2), padding=1), nn.LeakyReLU(0.1),
+        )
+        self.fc_encoder = nn.Linear(math.prod(self.feature_shape), latent_dim)
+        self.fc_decoder = nn.Linear(latent_dim, math.prod(self.feature_shape))
+        layers = []
+        for index, (cin, cout) in enumerate([(128, 128), (128, 64), (64, 32)]):
+            source, target = sizes[3-index], sizes[2-index]
+            output_padding = (0, *(t - (2*s - 1) for s, t in zip(source, target)))
+            layers.extend([
+                nn.ConvTranspose3d(cin, cout, 3, stride=(1, 2, 2), padding=1,
+                                   output_padding=output_padding),
+                nn.LeakyReLU(0.1), FactorizedResidualBlock3D(cout),
+            ])
+        layers.append(nn.Conv3d(32, channels, 3, padding=1))
+        self.decoder = nn.Sequential(*layers)
+
+    def encode(self, x):
+        return self.fc_encoder(self.encoder(x).flatten(1))
+
+    def decode(self, latent):
+        return self.decoder(self.fc_decoder(latent).reshape(-1, *self.feature_shape))
+
+    def forward(self, x):
+        latent = self.encode(x)
+        reconstruction = self.decode(latent)
+        if tuple(reconstruction.shape[1:]) != self.input_shape:
+            raise RuntimeError('Decoder output does not match the configured input shape.')
+        return reconstruction, latent
+
+
 def get_model(name, **kwargs):
     """Фабрика моделей"""
     models = {
+        'ResidualSAM3DAutoencoder': ResidualSAM3DAutoencoder,
         'Conv3DAutoencoder': Conv3DAutoencoder,
         'SAM3DAutoencoderV2': SAM3DAutoencoderV2,
         'SAM3DAutoencoderV3': SAM3DAutoencoderV3,

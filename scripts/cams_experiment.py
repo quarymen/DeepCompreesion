@@ -452,7 +452,7 @@ def run_experiments(x, raw, lo, scale, frames, splits, counts, config, output):
     methods = config.get('methods', ['DCT','PCA','PlainConv3DAutoencoder','Conv3DAutoencoder'])
     allowed_methods = {
         'DCT', 'PCA', 'PlainConv3DAutoencoder', 'Conv3DAutoencoder',
-        'SAM3DAutoencoderV2', 'SAM3DAutoencoderV3',
+        'SAM3DAutoencoderV2', 'SAM3DAutoencoderV3', 'ResidualSAM3DAutoencoder',
     }
     unknown_methods = set(methods) - allowed_methods
     if unknown_methods:
