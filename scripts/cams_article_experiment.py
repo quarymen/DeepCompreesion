@@ -224,6 +224,10 @@ def _run(x, raw, lo, scale, frames, splits, counts, config, output):
     if device.type not in {'cpu', 'cuda'}:
         raise ValueError('Profiling supports cpu or cuda')
     if device.type == 'cuda':
+        if not torch.cuda.is_available():
+            raise ValueError('CUDA was requested but is not available in this PyTorch environment.')
+        if device.index is None:
+            device = torch.device('cuda', torch.cuda.current_device())
         torch.cuda.set_device(device)
     rows = []
     print(f'Neural device: {device}; baselines: cpu; runs: {len(jobs)}', flush=True)
