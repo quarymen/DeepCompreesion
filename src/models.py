@@ -15,8 +15,6 @@ class SpatialAttentionModule3D(nn.Module):
         padding = kernel_size // 2
         self.conv3d = nn.Conv3d(3, 1, kernel_size, padding=padding, bias=False)
         self.sigmoid = nn.Sigmoid()
-        # Начинаем почти с исходной модели и постепенно учим вклад attention.
-        self.alpha = nn.Parameter(torch.tensor(1e-3))
 
     def forward(self, x):
         avg_out = torch.mean(x, dim=1, keepdim=True) 
@@ -25,9 +23,8 @@ class SpatialAttentionModule3D(nn.Module):
         
         x_combined = torch.cat([avg_out, max_out, std_out], dim=1) 
         spatial_attention_map = self.conv3d(x_combined)
-        centered_attention = 2.0 * self.sigmoid(spatial_attention_map) - 1.0
 
-        return x + self.alpha * x * centered_attention
+        return x * self.sigmoid(spatial_attention_map)
 
 
 class Conv3DAutoencoder(nn.Module):
