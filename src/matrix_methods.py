@@ -144,7 +144,7 @@ class UMAPCompressor:
         inverse_neighbors: int = 5,
     ):
         self.n_components = int(n_components)
-        self.random_state = None
+        self.random_state = random_state
         self.n_neighbors = int(n_neighbors)
         self.min_dist = float(min_dist)
         self.metric = metric
@@ -173,7 +173,7 @@ class UMAPCompressor:
             n_neighbors=n_neighbors,
             min_dist=self.min_dist,
             metric=self.metric,
-            random_state=None,
+            random_state=self.random_state,
             n_jobs=self.n_jobs,
         )
         if verbose:

@@ -451,6 +451,13 @@ class ResidualSAM3DAutoencoder(nn.Module):
 
 def get_model(name, **kwargs):
     """Фабрика моделей"""
+    if name in {'ArticleSAMAutoencoder', 'ArticlePlainAutoencoder'}:
+        try:
+            from .article_models import ArticleSAMAutoencoder, ArticlePlainAutoencoder
+        except ImportError:
+            from article_models import ArticleSAMAutoencoder, ArticlePlainAutoencoder
+        return {'ArticleSAMAutoencoder': ArticleSAMAutoencoder,
+                'ArticlePlainAutoencoder': ArticlePlainAutoencoder}[name](**kwargs)
     models = {
         'RefinedSAM3DAutoencoder': RefinedSAM3DAutoencoder,
         'ResidualSAM3DAutoencoder': ResidualSAM3DAutoencoder,

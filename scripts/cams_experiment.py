@@ -371,8 +371,12 @@ def fit_ae(name, dim, train, val, config, path, device):
         raise ValueError('grad_clip_norm must be finite and positive')
     for epoch in range(1,config['epochs']+1):
         losses = []
+        phase_seconds = []
         max_grad_norm = 0.
         for phase, loader in enumerate(loaders):
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            phase_start = time.perf_counter()
             model.train(phase==0)
             total, count = 0., 0
             with torch.set_grad_enabled(phase==0):
@@ -393,14 +397,18 @@ def fit_ae(name, dim, train, val, config, path, device):
                         optimizer.step()
                     total += loss.item()*len(x); count += len(x)
             losses.append(total/count)
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            phase_seconds.append(time.perf_counter() - phase_start)
         history.append(dict(epoch=epoch, train_loss=losses[0], validation_loss=losses[1],
+                            train_seconds=phase_seconds[0], validation_seconds=phase_seconds[1],
                             max_grad_norm_before_clip=max_grad_norm))
         if losses[1] < best:
             best, best_epoch = losses[1], epoch
             torch.save(model.state_dict(), path/'best.pt')
         pd.DataFrame(history).to_csv(path/'history.csv', index=False)
         if epoch==1 or epoch%config.get('log_every', 10)==0:
-            print(f'{name}, dim={dim}, epoch={epoch}/{config["epochs"]}, train={losses[0]:.6f}, val={losses[1]:.6f}, max_grad_norm={max_grad_norm:.4g}', flush=True)
+            print(f'{name}, dim={dim}, epoch={epoch}/{config["epochs"]}, train={losses[0]:.6f}, val={losses[1]:.6f}, max_grad_norm={max_grad_norm:.4g}, train_seconds={phase_seconds[0]:.2f}, val_seconds={phase_seconds[1]:.2f}', flush=True)
     model.load_state_dict(torch.load(path/'best.pt', map_location=device, weights_only=True))
     model.eval()
     return model, best_epoch
