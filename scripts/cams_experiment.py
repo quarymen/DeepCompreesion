@@ -350,6 +350,17 @@ def seed_all(seed):
 
 def fit_ae(name, dim, train, val, config, path, device):
     model = get_model(name, latent_dim=dim, input_shape=(1,*train.shape[1:]), dropout_rate=config['dropout']).to(device)
+    total_parameters = sum(parameter.numel() for parameter in model.parameters())
+    trainable_parameters = sum(
+        parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+    )
+    print(f'  Model architecture ({name}):', flush=True)
+    print(model, flush=True)
+    print(
+        f'  Input shape: {(1, *train.shape[1:])}; latent_dim={dim}; '
+        f'parameters={total_parameters:,}; trainable={trainable_parameters:,}',
+        flush=True,
+    )
     optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=config['weight_decay'])
     loaders = [DataLoader(TensorDataset(torch.from_numpy(np.array(a, dtype='float32'))[:,None]),
                           batch_size=config['batch_size'], shuffle=(i==0), num_workers=0)
