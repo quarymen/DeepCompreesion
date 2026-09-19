@@ -336,6 +336,31 @@ class SimpleConv3DAutoencoder(nn.Module):
         return x, latent
 
 
+class RefinedSAM3DAutoencoder(Conv3DAutoencoder):
+    """Original SAM encoder with learned refinement after each decoder upsampling."""
+
+    def __init__(self, latent_dim=64, input_shape=(1, 6, 96, 84), dropout_rate=0.0):
+        super().__init__(latent_dim=latent_dim, input_shape=input_shape,
+                         dropout_rate=dropout_rate, use_attention=True)
+        # Reuse the exact inverse sizes from the original decoder.
+        paddings = [layer.output_padding for layer in self.decoder_conv
+                    if isinstance(layer, nn.ConvTranspose3d)]
+        layers = []
+        for index, (cin, cout) in enumerate([(128, 64), (64, 32), (32, 32)]):
+            layers.extend([
+                nn.ConvTranspose3d(cin, cout, 3, stride=(1, 2, 2), padding=1,
+                                   output_padding=paddings[index]),
+                nn.LeakyReLU(0.1),
+            ])
+            if index < 2:
+                layers.extend([
+                    nn.Conv3d(cout, cout, 3, padding=1),
+                    nn.LeakyReLU(0.1), SpatialAttentionModule3D(),
+                ])
+        layers.append(nn.Conv3d(32, input_shape[0], 3, padding=1))
+        self.decoder_conv = nn.Sequential(*layers)
+
+
 class MultiscaleSpatialAttention3D(nn.Module):
     """Identity-initialized spatial gate with two horizontal receptive fields."""
 
@@ -427,6 +452,7 @@ class ResidualSAM3DAutoencoder(nn.Module):
 def get_model(name, **kwargs):
     """Фабрика моделей"""
     models = {
+        'RefinedSAM3DAutoencoder': RefinedSAM3DAutoencoder,
         'ResidualSAM3DAutoencoder': ResidualSAM3DAutoencoder,
         'Conv3DAutoencoder': Conv3DAutoencoder,
         'SAM3DAutoencoderV2': SAM3DAutoencoderV2,

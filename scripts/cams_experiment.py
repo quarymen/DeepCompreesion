@@ -366,8 +366,12 @@ def fit_ae(name, dim, train, val, config, path, device):
                           batch_size=config['batch_size'], shuffle=(i==0), num_workers=0)
                for i,a in enumerate([train,val])]
     history, best, best_epoch = [], float('inf'), None
+    grad_clip = config.get('grad_clip_norm')
+    if grad_clip is not None and (not np.isfinite(grad_clip) or grad_clip <= 0):
+        raise ValueError('grad_clip_norm must be finite and positive')
     for epoch in range(1,config['epochs']+1):
         losses = []
+        max_grad_norm = 0.
         for phase, loader in enumerate(loaders):
             model.train(phase==0)
             total, count = 0., 0
@@ -379,16 +383,24 @@ def fit_ae(name, dim, train, val, config, path, device):
                     if not torch.isfinite(loss):
                         raise ValueError('Nonfinite training loss')
                     if phase==0:
-                        optimizer.zero_grad(set_to_none=True); loss.backward(); optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
+                        loss.backward()
+                        norm = torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), grad_clip if grad_clip is not None else float('inf'),
+                            error_if_nonfinite=True,
+                        )
+                        max_grad_norm = max(max_grad_norm, float(norm))
+                        optimizer.step()
                     total += loss.item()*len(x); count += len(x)
             losses.append(total/count)
-        history.append(dict(epoch=epoch, train_loss=losses[0], validation_loss=losses[1]))
+        history.append(dict(epoch=epoch, train_loss=losses[0], validation_loss=losses[1],
+                            max_grad_norm_before_clip=max_grad_norm))
         if losses[1] < best:
             best, best_epoch = losses[1], epoch
             torch.save(model.state_dict(), path/'best.pt')
         pd.DataFrame(history).to_csv(path/'history.csv', index=False)
-        if epoch==1 or epoch%10==0:
-            print(f'{name}, dim={dim}, epoch={epoch}/{config["epochs"]}, train={losses[0]:.6f}, val={losses[1]:.6f}', flush=True)
+        if epoch==1 or epoch%config.get('log_every', 10)==0:
+            print(f'{name}, dim={dim}, epoch={epoch}/{config["epochs"]}, train={losses[0]:.6f}, val={losses[1]:.6f}, max_grad_norm={max_grad_norm:.4g}', flush=True)
     model.load_state_dict(torch.load(path/'best.pt', map_location=device, weights_only=True))
     model.eval()
     return model, best_epoch
@@ -453,6 +465,7 @@ def run_experiments(x, raw, lo, scale, frames, splits, counts, config, output):
     allowed_methods = {
         'DCT', 'PCA', 'PlainConv3DAutoencoder', 'Conv3DAutoencoder',
         'SAM3DAutoencoderV2', 'SAM3DAutoencoderV3', 'ResidualSAM3DAutoencoder',
+        'RefinedSAM3DAutoencoder',
     }
     unknown_methods = set(methods) - allowed_methods
     if unknown_methods:
@@ -508,6 +521,17 @@ def run_experiments(x, raw, lo, scale, frames, splits, counts, config, output):
                         torch.cuda.synchronize()
                     fit_seconds = time.perf_counter()-start
                     print(f'  Fit completed in {fit_seconds:.1f} s', flush=True)
+                    diagnostic_count = min(int(config.get('train_diagnostic_frames', 0)), len(train))
+                    if diagnostic_count > 0:
+                        rng = np.random.default_rng(config.get('subset_seed', 42))
+                        local_ids = np.sort(rng.choice(len(train), diagnostic_count, replace=False))
+                        errors = [float(np.mean((predict(train[i:i+1]).astype('float64')
+                                                  - train[i:i+1])**2)) for i in local_ids]
+                        pd.DataFrame({
+                            'frame': splits[f'train_{n}'][local_ids], 'mse': errors,
+                        }).to_csv(path/'train_diagnostic.csv', index=False)
+                        print(f'  Fixed train diagnostic: {diagnostic_count} frames, '
+                              f'eval MSE={np.mean(errors):.8g}', flush=True)
                     run_rows = []
                     split_indices = {
                         'train': splits[f'train_{n}'],
