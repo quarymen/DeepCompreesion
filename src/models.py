@@ -141,6 +141,168 @@ class PlainConv3DAutoencoder(Conv3DAutoencoder):
         )
 
 
+def _group_count(channels):
+    for groups in (8, 4, 2, 1):
+        if channels % groups == 0:
+            return groups
+
+
+class ResidualBlock3D(nn.Module):
+    """Two convolutions with an identity skip, GroupNorm and SiLU."""
+
+    def __init__(self, channels, dropout_rate=0.1):
+        super().__init__()
+        groups = _group_count(channels)
+        self.conv1 = nn.Conv3d(channels, channels, 3, padding=1, bias=False)
+        self.norm1 = nn.GroupNorm(groups, channels)
+        self.conv2 = nn.Conv3d(channels, channels, 3, padding=1, bias=False)
+        self.norm2 = nn.GroupNorm(groups, channels)
+        self.activation = nn.SiLU(inplace=True)
+        self.dropout = nn.Dropout3d(dropout_rate) if dropout_rate > 0 else nn.Identity()
+
+    def forward(self, x):
+        residual = x
+        x = self.activation(self.norm1(self.conv1(x)))
+        x = self.dropout(x)
+        x = self.norm2(self.conv2(x))
+        return self.activation(x + residual)
+
+
+class ResidualSpatialAttention3D(nn.Module):
+    """Near-identity residual attention with a learnable contribution."""
+
+    def __init__(self, kernel_size=3):
+        super().__init__()
+        padding = kernel_size // 2
+        self.conv = nn.Conv3d(3, 1, kernel_size, padding=padding, bias=False)
+        # A small non-zero value lets the mask convolution receive gradients
+        # immediately while the module starts very close to an identity map.
+        self.alpha = nn.Parameter(torch.tensor(1e-3))
+
+    def forward(self, x):
+        statistics = torch.cat(
+            [x.mean(dim=1, keepdim=True),
+             x.amax(dim=1, keepdim=True),
+             x.std(dim=1, keepdim=True, unbiased=False)],
+            dim=1,
+        )
+        centered_mask = 2.0 * torch.sigmoid(self.conv(statistics)) - 1.0
+        return x * (1.0 + self.alpha * centered_mask)
+
+
+class ResidualConv3DAutoencoder(nn.Module):
+    """Symmetric residual 3D CAE with an exact spatial decoder."""
+
+    def __init__(self, latent_dim=64, input_shape=(1, 3, 96, 84),
+                 dropout_rate=0.1, use_attention=False, **kwargs):
+        super().__init__()
+        if len(input_shape) != 4:
+            raise ValueError(f'input_shape must be (C,D,H,W), got {input_shape}')
+        channels, depth, height, width = map(int, input_shape)
+        if min(depth, height, width) < 1:
+            raise ValueError(f'Invalid input shape: {input_shape}')
+        self.input_shape = tuple(map(int, input_shape))
+        self.latent_dim = int(latent_dim)
+
+        def norm(ch):
+            return nn.GroupNorm(_group_count(ch), ch)
+
+        def attention():
+            return ResidualSpatialAttention3D() if use_attention else nn.Identity()
+
+        def down(in_channels, out_channels):
+            return nn.Sequential(
+                nn.Conv3d(in_channels, out_channels, 3,
+                          stride=(1, 2, 2), padding=1, bias=False),
+                norm(out_channels),
+                nn.SiLU(inplace=True),
+            )
+
+        self.stem = nn.Sequential(
+            nn.Conv3d(channels, 16, 3, padding=1, bias=False),
+            norm(16),
+            nn.SiLU(inplace=True),
+        )
+        self.enc1 = ResidualBlock3D(16, dropout_rate)
+        self.attn_enc1 = attention()
+        self.down1 = down(16, 32)
+        self.enc2 = ResidualBlock3D(32, dropout_rate)
+        self.attn_enc2 = attention()
+        self.down2 = down(32, 48)
+        self.enc3 = ResidualBlock3D(48, dropout_rate)
+        self.attn_enc3 = attention()
+        self.down3 = down(48, 64)
+        self.bottleneck = ResidualBlock3D(64, dropout_rate)
+        self.attn_bottleneck = attention()
+
+        spatial_sizes = [(height, width)]
+        for _ in range(3):
+            previous_h, previous_w = spatial_sizes[-1]
+            spatial_sizes.append(((previous_h + 1) // 2, (previous_w + 1) // 2))
+        encoded_h, encoded_w = spatial_sizes[-1]
+        self.encoder_shape = (64, depth, encoded_h, encoded_w)
+        self.flatten_size = 64 * depth * encoded_h * encoded_w
+        self.fc_encoder = nn.Linear(self.flatten_size, self.latent_dim)
+        self.fc_decoder = nn.Linear(self.latent_dim, self.flatten_size)
+
+        def output_padding(source, target):
+            value = target - (2 * source - 1)
+            if value not in (0, 1):
+                raise ValueError(f'Cannot invert spatial size {source} -> {target}')
+            return value
+
+        def up(in_channels, out_channels, source_size, target_size):
+            op_h = output_padding(source_size[0], target_size[0])
+            op_w = output_padding(source_size[1], target_size[1])
+            return nn.Sequential(
+                nn.ConvTranspose3d(
+                    in_channels, out_channels, 3, stride=(1, 2, 2), padding=1,
+                    output_padding=(0, op_h, op_w), bias=False,
+                ),
+                norm(out_channels),
+                nn.SiLU(inplace=True),
+            )
+
+        self.dec_bottleneck = ResidualBlock3D(64, dropout_rate)
+        self.attn_dec_bottleneck = attention()
+        self.up3 = up(64, 48, spatial_sizes[3], spatial_sizes[2])
+        self.dec3 = ResidualBlock3D(48, dropout_rate)
+        self.attn_dec3 = attention()
+        self.up2 = up(48, 32, spatial_sizes[2], spatial_sizes[1])
+        self.dec2 = ResidualBlock3D(32, dropout_rate)
+        self.attn_dec2 = attention()
+        self.up1 = up(32, 16, spatial_sizes[1], spatial_sizes[0])
+        self.dec1 = ResidualBlock3D(16, dropout_rate)
+        self.attn_dec1 = attention()
+        self.head = nn.Conv3d(16, channels, 3, padding=1)
+
+    def forward(self, x):
+        original_shape = x.shape[1:]
+        x = self.attn_enc1(self.enc1(self.stem(x)))
+        x = self.attn_enc2(self.enc2(self.down1(x)))
+        x = self.attn_enc3(self.enc3(self.down2(x)))
+        x = self.attn_bottleneck(self.bottleneck(self.down3(x)))
+        latent = self.fc_encoder(x.flatten(1))
+        x = self.fc_decoder(latent).view(x.size(0), *self.encoder_shape)
+        x = self.attn_dec_bottleneck(self.dec_bottleneck(x))
+        x = self.attn_dec3(self.dec3(self.up3(x)))
+        x = self.attn_dec2(self.dec2(self.up2(x)))
+        x = self.attn_dec1(self.dec1(self.up1(x)))
+        reconstructed = self.head(x)
+        if reconstructed.shape[1:] != original_shape:
+            raise RuntimeError(
+                f'Exact decoder shape mismatch: {reconstructed.shape[1:]} vs {original_shape}'
+            )
+        return reconstructed, latent
+
+
+class ResidualAttentionConv3DAutoencoder(ResidualConv3DAutoencoder):
+    """Residual CAE with near-identity spatial attention in matching stages."""
+
+    def __init__(self, **kwargs):
+        super().__init__(use_attention=True, **kwargs)
+
+
 class SimpleConv3DAutoencoder(nn.Module):
     """
     Простой 3D автоэнкодер без attention модулей
@@ -236,6 +398,8 @@ def get_model(name, **kwargs):
     models = {
         'Conv3DAutoencoder': Conv3DAutoencoder,
         'PlainConv3DAutoencoder': PlainConv3DAutoencoder,
+        'ResidualConv3DAutoencoder': ResidualConv3DAutoencoder,
+        'ResidualAttentionConv3DAutoencoder': ResidualAttentionConv3DAutoencoder,
         'SimpleConv3DAutoencoder': SimpleConv3DAutoencoder
     }
     
@@ -257,6 +421,11 @@ if __name__ == "__main__":
 
     print("\nТест PlainConv3DAutoencoder:")
     model = PlainConv3DAutoencoder(latent_dim=64, input_shape=input_shape)
+    out, latent = model(x)
+    print(f"  Вход: {x.shape}, Выход: {out.shape}, Latent: {latent.shape}")
+
+    print("\nТест ResidualAttentionConv3DAutoencoder:")
+    model = ResidualAttentionConv3DAutoencoder(latent_dim=64, input_shape=input_shape)
     out, latent = model(x)
     print(f"  Вход: {x.shape}, Выход: {out.shape}, Latent: {latent.shape}")
 
