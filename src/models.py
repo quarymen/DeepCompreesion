@@ -33,7 +33,8 @@ class Conv3DAutoencoder(nn.Module):
     """
     3D сверточный автоэнкодер с attention модулями
     """
-    def __init__(self, latent_dim=64, input_shape=(1, 32, 96, 84), dropout_rate=0.1, use_attention=True):
+    def __init__(self, latent_dim=64, input_shape=(1, 32, 96, 84), dropout_rate=0.1,
+                 use_attention=True, use_global_decoder=False):
         super(Conv3DAutoencoder, self).__init__()
         
         self.latent_dim = latent_dim
@@ -43,6 +44,7 @@ class Conv3DAutoencoder(nn.Module):
         self.input_width = input_shape[3]
         self.dropout_rate = dropout_rate
         self.use_attention = use_attention
+        self.use_global_decoder = use_global_decoder
 
         encoder_layers = []
         
@@ -82,13 +84,10 @@ class Conv3DAutoencoder(nn.Module):
         self.fc_encoder = nn.Linear(self.flatten_size, latent_dim)
         self.fc_decoder = nn.Linear(latent_dim, self.flatten_size)
 
-        # A compressed atmospheric field is dominated by smooth, global modes.
-        # The transposed-convolution path below is deliberately local, so on its
-        # own it has to approximate the global basis that PCA obtains directly.
-        # This branch learns a global reconstruction from the *same* latent code;
-        # the SAM convolutional decoder then supplies nonlinear/local corrections.
-        # It does not increase the transmitted payload (still latent_dim values).
-        self.global_decoder = nn.Linear(latent_dim, math.prod(input_shape))
+        self.global_decoder = (
+            nn.Linear(latent_dim, math.prod(input_shape))
+            if use_global_decoder else None
+        )
 
         # For Conv3d(kernel=3, stride=2, padding=1), each spatial size becomes
         # ceil(size/2). Compute the inverse output_padding for every decoder
@@ -153,15 +152,18 @@ class Conv3DAutoencoder(nn.Module):
         x = x.view(x.size(0), -1) 
         latent = self.fc_encoder(x)
 
-        global_reconstruction = self.global_decoder(latent).view(
-            latent.size(0), self.input_channels, self.target_depth,
-            self.target_height, self.target_width
-        )
-        
         x = self.fc_decoder(latent)
         x = x.view(x.size(0), *self.encoder_output_shape) 
         
-        x = self.decoder_conv(x) + global_reconstruction
+        x = self.decoder_conv(x)
+        if self.global_decoder is not None:
+            # V2 adds global modes from the same transmitted latent vector; the
+            # SAM convolutional path learns nonlinear and local corrections.
+            global_reconstruction = self.global_decoder(latent).view(
+                latent.size(0), self.input_channels, self.target_depth,
+                self.target_height, self.target_width
+            )
+            x = x + global_reconstruction
 
         expected_shape = (self.input_channels, self.target_depth,
                           self.target_height, self.target_width)
@@ -171,6 +173,19 @@ class Conv3DAutoencoder(nn.Module):
             )
         
         return x, latent
+
+
+class SAM3DAutoencoderV2(Conv3DAutoencoder):
+    """SAM3D autoencoder with a global linear reconstruction decoder branch."""
+
+    def __init__(self, latent_dim=64, input_shape=(1, 32, 96, 84), dropout_rate=0.1, **kwargs):
+        super().__init__(
+            latent_dim=latent_dim,
+            input_shape=input_shape,
+            dropout_rate=dropout_rate,
+            use_attention=True,
+            use_global_decoder=True,
+        )
 
 
 class PlainConv3DAutoencoder(Conv3DAutoencoder):
@@ -187,6 +202,7 @@ class PlainConv3DAutoencoder(Conv3DAutoencoder):
             input_shape=input_shape,
             dropout_rate=dropout_rate,
             use_attention=False,
+            use_global_decoder=False,
         )
 
 
@@ -284,6 +300,7 @@ def get_model(name, **kwargs):
     """Фабрика моделей"""
     models = {
         'Conv3DAutoencoder': Conv3DAutoencoder,
+        'SAM3DAutoencoderV2': SAM3DAutoencoderV2,
         'PlainConv3DAutoencoder': PlainConv3DAutoencoder,
         'SimpleConv3DAutoencoder': SimpleConv3DAutoencoder
     }

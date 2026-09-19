@@ -450,7 +450,10 @@ def run_experiments(x, raw, lo, scale, frames, splits, counts, config, output):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     rows = []
     methods = config.get('methods', ['DCT','PCA','PlainConv3DAutoencoder','Conv3DAutoencoder'])
-    allowed_methods = {'DCT','PCA','PlainConv3DAutoencoder','Conv3DAutoencoder'}
+    allowed_methods = {
+        'DCT', 'PCA', 'PlainConv3DAutoencoder', 'Conv3DAutoencoder',
+        'SAM3DAutoencoderV2',
+    }
     unknown_methods = set(methods) - allowed_methods
     if unknown_methods:
         raise ValueError(f'Unknown methods: {sorted(unknown_methods)}')

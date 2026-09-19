@@ -5,6 +5,7 @@ CO Autoencoder Project
 
 from .models import (
     Conv3DAutoencoder,
+    SAM3DAutoencoderV2,
     PlainConv3DAutoencoder,
     SimpleConv3DAutoencoder,
     get_model,
@@ -30,6 +31,7 @@ __author__ = 'CO Autoencoder Team'
 
 __all__ = [
     'Conv3DAutoencoder',
+    'SAM3DAutoencoderV2',
     'PlainConv3DAutoencoder',
     'SimpleConv3DAutoencoder',
     'get_model',
