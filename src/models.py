@@ -34,7 +34,8 @@ class Conv3DAutoencoder(nn.Module):
     3D сверточный автоэнкодер с attention модулями
     """
     def __init__(self, latent_dim=64, input_shape=(1, 32, 96, 84), dropout_rate=0.1,
-                 use_attention=True, use_global_decoder=False):
+                 use_attention=True, use_global_encoder=False,
+                 use_global_decoder=False):
         super(Conv3DAutoencoder, self).__init__()
         
         self.latent_dim = latent_dim
@@ -44,6 +45,7 @@ class Conv3DAutoencoder(nn.Module):
         self.input_width = input_shape[3]
         self.dropout_rate = dropout_rate
         self.use_attention = use_attention
+        self.use_global_encoder = use_global_encoder
         self.use_global_decoder = use_global_decoder
 
         encoder_layers = []
@@ -83,6 +85,24 @@ class Conv3DAutoencoder(nn.Module):
         
         self.fc_encoder = nn.Linear(self.flatten_size, latent_dim)
         self.fc_decoder = nn.Linear(latent_dim, self.flatten_size)
+
+        self.global_encoder = (
+            nn.Linear(math.prod(input_shape), latent_dim)
+            if use_global_encoder else None
+        )
+        self.latent_fusion = (
+            nn.Linear(2 * latent_dim, latent_dim)
+            if use_global_encoder else None
+        )
+        if self.latent_fusion is not None:
+            # Start from an equal mixture of global and SAM features. Training
+            # can then learn a different combination for every latent element.
+            with torch.no_grad():
+                self.latent_fusion.weight.zero_()
+                self.latent_fusion.bias.zero_()
+                identity = torch.eye(latent_dim)
+                self.latent_fusion.weight[:, :latent_dim].copy_(0.5 * identity)
+                self.latent_fusion.weight[:, latent_dim:].copy_(0.5 * identity)
 
         self.global_decoder = (
             nn.Linear(latent_dim, math.prod(input_shape))
@@ -148,9 +168,13 @@ class Conv3DAutoencoder(nn.Module):
         self.target_width = input_shape[3]
 
     def forward(self, x):
+        input_field = x
         x = self.encoder_conv(x)
         x = x.view(x.size(0), -1) 
         latent = self.fc_encoder(x)
+        if self.global_encoder is not None:
+            global_latent = self.global_encoder(input_field.flatten(start_dim=1))
+            latent = self.latent_fusion(torch.cat([global_latent, latent], dim=1))
 
         x = self.fc_decoder(latent)
         x = x.view(x.size(0), *self.encoder_output_shape) 
@@ -184,6 +208,21 @@ class SAM3DAutoencoderV2(Conv3DAutoencoder):
             input_shape=input_shape,
             dropout_rate=dropout_rate,
             use_attention=True,
+            use_global_encoder=False,
+            use_global_decoder=True,
+        )
+
+
+class SAM3DAutoencoderV3(Conv3DAutoencoder):
+    """SAM3D autoencoder with symmetric global encoder and decoder branches."""
+
+    def __init__(self, latent_dim=64, input_shape=(1, 32, 96, 84), dropout_rate=0.1, **kwargs):
+        super().__init__(
+            latent_dim=latent_dim,
+            input_shape=input_shape,
+            dropout_rate=dropout_rate,
+            use_attention=True,
+            use_global_encoder=True,
             use_global_decoder=True,
         )
 
@@ -202,6 +241,7 @@ class PlainConv3DAutoencoder(Conv3DAutoencoder):
             input_shape=input_shape,
             dropout_rate=dropout_rate,
             use_attention=False,
+            use_global_encoder=False,
             use_global_decoder=False,
         )
 
@@ -301,6 +341,7 @@ def get_model(name, **kwargs):
     models = {
         'Conv3DAutoencoder': Conv3DAutoencoder,
         'SAM3DAutoencoderV2': SAM3DAutoencoderV2,
+        'SAM3DAutoencoderV3': SAM3DAutoencoderV3,
         'PlainConv3DAutoencoder': PlainConv3DAutoencoder,
         'SimpleConv3DAutoencoder': SimpleConv3DAutoencoder
     }
