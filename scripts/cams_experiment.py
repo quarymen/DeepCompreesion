@@ -414,17 +414,14 @@ def evaluate(predict, x, ids, raw, lo, scale, frames, path, split, run_label='')
 
 def run_experiments(x, raw, lo, scale, frames, splits, counts, config, output):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print('Device:', device, '; runs:', len(counts)*len(config['latent_dims'])*len(config['seeds'])*4, flush=True)
     rows = []
     methods = config.get('methods', ['DCT','PCA','PlainConv3DAutoencoder','Conv3DAutoencoder'])
-    allowed_methods = {
-        'DCT', 'PCA', 'PlainConv3DAutoencoder', 'Conv3DAutoencoder',
-        'ResidualConv3DAutoencoder', 'ResidualAttentionConv3DAutoencoder',
-    }
+    allowed_methods = {'DCT','PCA','PlainConv3DAutoencoder','Conv3DAutoencoder'}
     unknown_methods = set(methods) - allowed_methods
     if unknown_methods:
         raise ValueError(f'Unknown methods: {sorted(unknown_methods)}')
     total_runs = len(counts)*len(config['latent_dims'])*len(config['seeds'])*len(methods)
-    print('Device:', device, '; runs:', total_runs, flush=True)
     run_number = 0
     for n in counts:
         train = np.asarray(x[splits[f'train_{n}']])
@@ -446,7 +443,6 @@ def run_experiments(x, raw, lo, scale, frames, splits, counts, config, output):
                     seed_all(seed)
                     start = time.perf_counter()
                     best_epoch, params = None, 0
-                    attention_alphas = []
                     model = None
                     if name=='DCT':
                         print('  Fitting DCT baseline', flush=True)
@@ -462,21 +458,6 @@ def run_experiments(x, raw, lo, scale, frames, splits, counts, config, output):
                         print(f'  Training neural network for {config["epochs"]} epochs', flush=True)
                         model, best_epoch = fit_ae(name,dim,train,val,config,path,device)
                         params = sum(p.numel() for p in model.parameters())
-                        attention_alphas = [
-                            float(module.alpha.detach().cpu())
-                            for module in model.modules()
-                            if hasattr(module, 'alpha') and isinstance(module.alpha, torch.Tensor)
-                        ]
-                        if attention_alphas:
-                            (path/'attention_alphas.json').write_text(
-                                json.dumps(attention_alphas, indent=2)
-                            )
-                            print(
-                                f'  Attention alpha: min={min(attention_alphas):.6g}, '
-                                f'mean={np.mean(attention_alphas):.6g}, '
-                                f'max={max(attention_alphas):.6g}',
-                                flush=True,
-                            )
                         def predict(a):
                             with torch.no_grad():
                                 return model(torch.from_numpy(np.array(a,dtype='float32'))[:,None].to(device))[0][:,0].cpu().numpy()
@@ -493,11 +474,7 @@ def run_experiments(x, raw, lo, scale, frames, splits, counts, config, output):
                                       seed=seed, split=split, evaluation_frames=len(ids), best_epoch=best_epoch,
                                       epochs=config['epochs'] if 'Autoencoder' in name else 0,
                                       fit_seconds=fit_seconds, parameters=params,
-                                      payload_bytes=payload_bytes, scaling_bytes_per_frame=x.shape[1]*2*4,
-                                      attention_alpha_mean=(float(np.mean(attention_alphas))
-                                                            if attention_alphas else None),
-                                      attention_alpha_max_abs=(float(np.max(np.abs(attention_alphas)))
-                                                               if attention_alphas else None))
+                                      payload_bytes=payload_bytes, scaling_bytes_per_frame=x.shape[1]*2*4)
                         run_rows.append(result)
                     completed.write_text(json.dumps(run_rows,indent=2))
                     rows.extend(run_rows)
