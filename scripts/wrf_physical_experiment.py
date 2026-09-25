@@ -201,33 +201,9 @@ def write_split_summary(output: Path, frames: pd.DataFrame, splits: dict):
     np.savez(output / 'split_indices.npz', **splits)
 
 
-def run_one(mode: str, x, raw, lo, scale, frames, records, base_config, args):
-    seed = int(args.seed if args.seed is not None else base_config['data'].get('random_seed', 42))
-    output = Path(args.output_dir)
-    if not output.is_absolute():
-        output = ROOT / output
-    output = output / mode
-    output.mkdir(parents=True, exist_ok=True)
 
-    completed_metrics = output / 'metrics_all_runs.csv'
-    if completed_metrics.exists() and not args.force:
-        print(f'Reusing completed WRF {mode} metrics: {completed_metrics}', flush=True)
-        metrics = pd.read_csv(completed_metrics)
-        save_physical_mse_tables(output, metrics.assign(protocol=mode), mode)
-        return metrics
-
-    if mode == 'random':
-        val_fraction = args.random_validation_fraction
-        if val_fraction is None:
-            val_fraction = float(base_config['data'].get('val_split_ratio', 0.10))
-        splits, counts = make_random_splits(len(frames), seed, val_fraction, args.random_test_fraction)
-    elif mode == 'date':
-        splits, counts = make_date_splits(frames, seed, args.date_validation_dates, args.date_test_dates)
-    else:
-        raise ValueError(mode)
-
-    write_split_summary(output, frames, splits)
-    article_config = dict(
+def make_article_config(base_config: dict, args: argparse.Namespace, seed: int) -> dict:
+    return dict(
         methods=args.methods,
         latent_dims=args.latent_dims,
         tt_ranks=[tuple(int(v) for v in item.split(',')) for item in args.tt_ranks],
@@ -252,6 +228,98 @@ def run_one(mode: str, x, raw, lo, scale, frames, records, base_config, args):
         umap_inverse_neighbors=args.umap_inverse_neighbors,
         umap_evaluation_batch_size=args.umap_evaluation_batch_size,
     )
+
+
+def expected_metric_rows(article_config: dict) -> int:
+    methods = article_config['methods']
+    n_seed = len(article_config['seeds'])
+    n_split = len(article_config['evaluation_splits'])
+    n_jobs = 0
+    for method in methods:
+        n_settings = len(article_config['tt_ranks']) if method == 'TT-SVD' else len(article_config['latent_dims'])
+        n_jobs += n_settings * n_seed
+    return n_jobs * n_split
+
+
+def metrics_are_complete(path: Path, article_config: dict) -> bool:
+    if not path.exists():
+        return False
+    try:
+        table = pd.read_csv(path)
+    except Exception as exc:
+        print(f'Existing metrics file cannot be read and will be recomputed: {path} ({exc})', flush=True)
+        return False
+    required = {'method', 'split', 'physical_mse'}
+    missing = required - set(table.columns)
+    if missing:
+        print(f'Existing metrics file is incomplete; missing columns {sorted(missing)}: {path}', flush=True)
+        return False
+    expected = expected_metric_rows(article_config)
+    actual = len(table.dropna(subset=['method', 'split', 'physical_mse']))
+    if actual < expected:
+        print(f'Existing metrics file is partial: {actual}/{expected} rows with physical_mse in {path}', flush=True)
+        return False
+    requested_splits = set(article_config['evaluation_splits'])
+    if set(table['split'].dropna()) & requested_splits != requested_splits:
+        print(f'Existing metrics file lacks requested splits {sorted(requested_splits)}: {path}', flush=True)
+        return False
+    if 'seed' in table.columns:
+        present_seeds = set(table['seed'].dropna().astype(int))
+        requested_seeds = set(int(seed) for seed in article_config['seeds'])
+        if present_seeds & requested_seeds != requested_seeds:
+            print(f'Existing metrics file lacks requested seeds {sorted(requested_seeds)}: {path}', flush=True)
+            return False
+    for split in article_config['evaluation_splits']:
+        split_table = table[table['split'] == split]
+        for method in article_config['methods']:
+            method_table = split_table[split_table['method'] == method]
+            if method_table.empty:
+                print(f'Existing metrics file lacks method={method}, split={split}: {path}', flush=True)
+                return False
+            if method == 'TT-SVD':
+                if len(method_table.dropna(subset=['physical_mse'])) < len(article_config['tt_ranks']) * len(article_config['seeds']):
+                    print(f'Existing metrics file lacks some TT-SVD ranks for split={split}: {path}', flush=True)
+                    return False
+            else:
+                if 'latent_dim' not in method_table.columns:
+                    print(f'Existing metrics file lacks latent_dim for method={method}: {path}', flush=True)
+                    return False
+                present_dims = set(method_table['latent_dim'].dropna().astype(int))
+                requested_dims = set(int(dim) for dim in article_config['latent_dims'])
+                if present_dims & requested_dims != requested_dims:
+                    missing_dims = sorted(requested_dims - present_dims)
+                    print(f'Existing metrics file lacks method={method}, split={split}, latent dims={missing_dims}: {path}', flush=True)
+                    return False
+    print(f'Existing metrics file is complete: {actual}/{expected} rows in {path}', flush=True)
+    return True
+
+def run_one(mode: str, x, raw, lo, scale, frames, records, base_config, args):
+    seed = int(args.seed if args.seed is not None else base_config['data'].get('random_seed', 42))
+    article_config = make_article_config(base_config, args, seed)
+    output = Path(args.output_dir)
+    if not output.is_absolute():
+        output = ROOT / output
+    output = output / mode
+    output.mkdir(parents=True, exist_ok=True)
+
+    completed_metrics = output / 'metrics_all_runs.csv'
+    if metrics_are_complete(completed_metrics, article_config) and not args.force:
+        print(f'Reusing completed WRF {mode} metrics: {completed_metrics}', flush=True)
+        metrics = pd.read_csv(completed_metrics)
+        save_physical_mse_tables(output, metrics.assign(protocol=mode), mode)
+        return metrics
+
+    if mode == 'random':
+        val_fraction = args.random_validation_fraction
+        if val_fraction is None:
+            val_fraction = float(base_config['data'].get('val_split_ratio', 0.10))
+        splits, counts = make_random_splits(len(frames), seed, val_fraction, args.random_test_fraction)
+    elif mode == 'date':
+        splits, counts = make_date_splits(frames, seed, args.date_validation_dates, args.date_test_dates)
+    else:
+        raise ValueError(mode)
+
+    write_split_summary(output, frames, splits)
     protocol = dict(split_mode=mode, seed=seed, config_path=str(Path(args.config)),
                     article_config=article_config, records=records)
     (output / 'protocol.json').write_text(json.dumps(protocol, indent=2, ensure_ascii=False))
@@ -289,11 +357,13 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     modes = ['random', 'date'] if args.split_mode == 'both' else [args.split_mode]
 
+    seed = int(args.seed if args.seed is not None else base_config['data'].get('random_seed', 42))
+    article_config = make_article_config(base_config, args, seed)
     summaries = []
     pending = []
     for mode in modes:
         completed_metrics = out / mode / 'metrics_all_runs.csv'
-        if completed_metrics.exists() and not args.force:
+        if metrics_are_complete(completed_metrics, article_config) and not args.force:
             print(f'Reusing completed WRF {mode} metrics: {completed_metrics}', flush=True)
             tagged = pd.read_csv(completed_metrics).assign(protocol=mode)
             tagged.to_csv(out / f'{mode}_metrics_all_runs.csv', index=False)
