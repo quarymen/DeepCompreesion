@@ -254,6 +254,24 @@ def run_one(mode: str, x, raw, lo, scale, frames, records, base_config, args):
     return metrics
 
 
+
+def save_physical_mse_tables(output: Path, metrics: pd.DataFrame, prefix: str):
+    """Save method x latent_dim physical-MSE tables for validation/test splits."""
+    required = {'method', 'split', 'latent_dim', 'physical_mse'}
+    missing = required - set(metrics.columns)
+    if missing:
+        raise ValueError(f'Cannot save physical_mse tables; missing columns: {sorted(missing)}')
+    for split in sorted(metrics['split'].dropna().unique()):
+        subset = metrics[(metrics['split'] == split) & metrics['latent_dim'].notna()].copy()
+        if subset.empty:
+            continue
+        subset['latent_dim'] = subset['latent_dim'].astype(int)
+        table = subset.pivot_table(
+            index='method', columns='latent_dim', values='physical_mse', aggfunc='mean'
+        ).sort_index()
+        table.columns = [str(int(c)) for c in table.columns]
+        table.to_csv(output / f'physical_mse_{prefix}_{split}.csv')
+
 def main():
     args = parse_args()
     base_config = load_config(args.config)
@@ -266,10 +284,15 @@ def main():
     summaries = []
     for mode in modes:
         metrics = run_one(mode, x, raw, lo, scale, frames, records, base_config, args)
-        metrics.assign(protocol=mode).to_csv(out / f'{mode}_metrics_all_runs.csv', index=False)
-        summaries.append(metrics.assign(protocol=mode))
+        tagged = metrics.assign(protocol=mode)
+        tagged.to_csv(out / f'{mode}_metrics_all_runs.csv', index=False)
+        save_physical_mse_tables(out, tagged, mode)
+        save_physical_mse_tables(out / mode, tagged, mode)
+        summaries.append(tagged)
     combined = pd.concat(summaries, ignore_index=True)
     combined.to_csv(out / 'wrf_random_date_metrics_all_runs.csv', index=False)
+    for protocol, part in combined.groupby('protocol'):
+        save_physical_mse_tables(out, part, str(protocol))
     print('Saved combined metrics:', out / 'wrf_random_date_metrics_all_runs.csv', flush=True)
     print('Physical columns:', [c for c in combined.columns if c.startswith('physical_')], flush=True)
 
