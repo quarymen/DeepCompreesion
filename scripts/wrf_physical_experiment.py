@@ -66,6 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--umap-evaluation-batch-size', type=int, default=16)
     parser.add_argument('--wavelet', default='haar')
     parser.add_argument('--memory-sample-interval', type=float, default=0.05)
+    parser.add_argument('--force', action='store_true', help='Recompute split-level metrics even if metrics_all_runs.csv exists.')
     return parser.parse_args()
 
 
@@ -208,6 +209,13 @@ def run_one(mode: str, x, raw, lo, scale, frames, records, base_config, args):
     output = output / mode
     output.mkdir(parents=True, exist_ok=True)
 
+    completed_metrics = output / 'metrics_all_runs.csv'
+    if completed_metrics.exists() and not args.force:
+        print(f'Reusing completed WRF {mode} metrics: {completed_metrics}', flush=True)
+        metrics = pd.read_csv(completed_metrics)
+        save_physical_mse_tables(output, metrics.assign(protocol=mode), mode)
+        return metrics
+
     if mode == 'random':
         val_fraction = args.random_validation_fraction
         if val_fraction is None:
@@ -279,16 +287,34 @@ def main():
     if not out.is_absolute():
         out = ROOT / out
     out.mkdir(parents=True, exist_ok=True)
-    x, raw, lo, scale, frames, records = load_wrf_arrays(base_config, out)
     modes = ['random', 'date'] if args.split_mode == 'both' else [args.split_mode]
+
     summaries = []
+    pending = []
     for mode in modes:
-        metrics = run_one(mode, x, raw, lo, scale, frames, records, base_config, args)
-        tagged = metrics.assign(protocol=mode)
-        tagged.to_csv(out / f'{mode}_metrics_all_runs.csv', index=False)
-        save_physical_mse_tables(out, tagged, mode)
-        save_physical_mse_tables(out / mode, tagged, mode)
-        summaries.append(tagged)
+        completed_metrics = out / mode / 'metrics_all_runs.csv'
+        if completed_metrics.exists() and not args.force:
+            print(f'Reusing completed WRF {mode} metrics: {completed_metrics}', flush=True)
+            tagged = pd.read_csv(completed_metrics).assign(protocol=mode)
+            tagged.to_csv(out / f'{mode}_metrics_all_runs.csv', index=False)
+            save_physical_mse_tables(out, tagged, mode)
+            save_physical_mse_tables(out / mode, tagged, mode)
+            summaries.append(tagged)
+        else:
+            pending.append(mode)
+
+    if pending:
+        x, raw, lo, scale, frames, records = load_wrf_arrays(base_config, out)
+        for mode in pending:
+            metrics = run_one(mode, x, raw, lo, scale, frames, records, base_config, args)
+            tagged = metrics.assign(protocol=mode)
+            tagged.to_csv(out / f'{mode}_metrics_all_runs.csv', index=False)
+            save_physical_mse_tables(out, tagged, mode)
+            save_physical_mse_tables(out / mode, tagged, mode)
+            summaries.append(tagged)
+    else:
+        print('All requested split-level metrics were found; NetCDF loading and model runs were skipped.', flush=True)
+
     combined = pd.concat(summaries, ignore_index=True)
     combined.to_csv(out / 'wrf_random_date_metrics_all_runs.csv', index=False)
     for protocol, part in combined.groupby('protocol'):
