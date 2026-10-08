@@ -1,0 +1,243 @@
+"""
+Модуль с архитектурами моделей для 3D Autoencoder
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class SpatialAttentionModule3D(nn.Module):
+    """Модуль пространственного внимания для 3D данных"""
+    
+    def __init__(self, kernel_size=3):
+        super(SpatialAttentionModule3D, self).__init__()
+        padding = kernel_size // 2
+        self.conv3d = nn.Conv3d(3, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True) 
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        std_out = torch.std(x, dim=1, keepdim=True)
+        
+        x_combined = torch.cat([avg_out, max_out, std_out], dim=1) 
+        spatial_attention_map = self.conv3d(x_combined)
+        
+        return x * self.sigmoid(spatial_attention_map)
+
+
+class Conv3DAutoencoder(nn.Module):
+    """
+    3D сверточный автоэнкодер с attention модулями
+    """
+    def __init__(self, latent_dim=64, input_shape=(1, 32, 96, 84), dropout_rate=0.1, use_attention=True):
+        super(Conv3DAutoencoder, self).__init__()
+        
+        self.latent_dim = latent_dim
+        self.input_channels = input_shape[0]
+        self.input_depth = input_shape[1]
+        self.input_height = input_shape[2]
+        self.input_width = input_shape[3]
+        self.dropout_rate = dropout_rate
+        self.use_attention = use_attention
+
+        encoder_layers = []
+        
+        # Блок 1 энкодера: (1, 32, 96, 84) -> (32, 16, 48, 42)
+        encoder_layers.append(nn.Conv3d(self.input_channels, 32, 3, stride=(1, 2, 2), padding=1))
+        encoder_layers.append(nn.ReLU())
+        if use_attention:
+            encoder_layers.append(SpatialAttentionModule3D())
+        if dropout_rate > 0:
+            encoder_layers.append(nn.Dropout3d(dropout_rate))
+        
+        # Блок 2 энкодера: (32, 16, 48, 42) -> (64, 8, 24, 21)
+        encoder_layers.append(nn.Conv3d(32, 64, 3, stride=(1, 2, 2), padding=1))
+        encoder_layers.append(nn.ReLU())
+        if use_attention:
+            encoder_layers.append(SpatialAttentionModule3D())
+        if dropout_rate > 0:
+            encoder_layers.append(nn.Dropout3d(dropout_rate))
+
+        # Блок 3 энкодера: (64, 8, 24, 21) -> (128, 4, 12, 11)
+        encoder_layers.append(nn.Conv3d(64, 128, 3, stride=(1, 2, 2), padding=1))
+        encoder_layers.append(nn.ReLU())
+        if use_attention:
+            encoder_layers.append(SpatialAttentionModule3D())
+        if dropout_rate > 0:
+            encoder_layers.append(nn.Dropout3d(dropout_rate))
+
+        self.encoder_conv = nn.Sequential(*encoder_layers)
+
+        # Вычисляем размер после свёрток
+        with torch.no_grad():
+            dummy = torch.randn(1, *input_shape)
+            encoded = self.encoder_conv(dummy)
+            self.flatten_size = encoded.numel() // encoded.shape[0]
+            self.encoder_output_shape = encoded.shape[1:]
+        
+        self.fc_encoder = nn.Linear(self.flatten_size, latent_dim)
+        self.fc_decoder = nn.Linear(latent_dim, self.flatten_size)
+        
+        decoder_layers = []
+        
+        # Блок 1 декодера: (128, 4, 12, 11) -> (64, 8, 24, 22)
+        decoder_layers.append(nn.ConvTranspose3d(128, 64, 3, stride=(1, 2, 2), padding=1, output_padding=(0, 0, 1)))
+        decoder_layers.append(nn.ReLU())
+        if use_attention:
+            decoder_layers.append(SpatialAttentionModule3D())
+        if dropout_rate > 0:
+            decoder_layers.append(nn.Dropout3d(dropout_rate))
+
+        # Блок 2 декодера: (64, 8, 24, 22) -> (32, 16, 48, 44)
+        decoder_layers.append(nn.ConvTranspose3d(64, 32, 3, stride=(1, 2, 2), padding=1, output_padding=(0, 0, 0)))
+        decoder_layers.append(nn.ReLU())
+        if use_attention:
+            decoder_layers.append(SpatialAttentionModule3D())
+        if dropout_rate > 0:
+            decoder_layers.append(nn.Dropout3d(dropout_rate))
+
+        # Блок 3 декодера: (32, 16, 48, 44) -> (1, 32, 96, 88)
+        decoder_layers.append(nn.ConvTranspose3d(32, self.input_channels, 3, stride=(1, 2, 2), padding=1, output_padding=(0, 0, 0)))
+        
+        self.decoder_conv = nn.Sequential(*decoder_layers)
+        
+        self.target_depth = input_shape[1]
+        self.target_height = input_shape[2]
+        self.target_width = input_shape[3]
+
+    def forward(self, x):
+        x = self.encoder_conv(x)
+        x = x.view(x.size(0), -1) 
+        latent = self.fc_encoder(x)
+        
+        x = self.fc_decoder(latent)
+        x = x.view(x.size(0), *self.encoder_output_shape) 
+        
+        x = self.decoder_conv(x)
+        
+        # Interpolate до точных размеров
+        x = F.interpolate(x, size=(self.target_depth, self.target_height, self.target_width),
+                          mode='trilinear', align_corners=False)
+        
+        return x, latent
+
+
+class SimpleConv3DAutoencoder(nn.Module):
+    """
+    Простой 3D автоэнкодер без attention модулей
+    """
+    def __init__(self, latent_dim=64, input_shape=(1, 32, 96, 84), dropout_rate=0.1):
+        super(SimpleConv3DAutoencoder, self).__init__()
+        
+        self.input_channels = input_shape[0]
+        self.target_depth = input_shape[1]
+        self.target_height = input_shape[2]
+        self.target_width = input_shape[3]
+        
+        # Энкодер
+        self.enc1 = nn.Sequential(
+            nn.Conv3d(1, 16, 3, stride=(1, 2, 2), padding=1),
+            nn.BatchNorm3d(16),
+            nn.ReLU(inplace=True),
+            nn.Dropout3d(dropout_rate)
+        )
+        
+        self.enc2 = nn.Sequential(
+            nn.Conv3d(16, 32, 3, stride=(1, 2, 2), padding=1),
+            nn.BatchNorm3d(32),
+            nn.ReLU(inplace=True),
+            nn.Dropout3d(dropout_rate)
+        )
+        
+        self.enc3 = nn.Sequential(
+            nn.Conv3d(32, 64, 3, stride=(1, 2, 2), padding=1),
+            nn.BatchNorm3d(64),
+            nn.ReLU(inplace=True),
+            nn.Dropout3d(dropout_rate)
+        )
+        
+        # Вычисляем размер после энкодера
+        with torch.no_grad():
+            dummy = torch.randn(1, *input_shape)
+            encoded = self.enc3(self.enc2(self.enc1(dummy)))
+            self.flatten_size = encoded.numel() // encoded.shape[0]
+            self.encoder_shape = encoded.shape[1:]
+        
+        # Latent space
+        self.fc_enc = nn.Linear(self.flatten_size, latent_dim)
+        self.fc_dec = nn.Linear(latent_dim, self.flatten_size)
+        
+        # Декодер
+        self.dec1 = nn.Sequential(
+            nn.ConvTranspose3d(64, 32, 3, stride=(1, 2, 2), padding=1, output_padding=(0, 0, 1)),
+            nn.BatchNorm3d(32),
+            nn.ReLU(inplace=True),
+            nn.Dropout3d(dropout_rate)
+        )
+        
+        self.dec2 = nn.Sequential(
+            nn.ConvTranspose3d(32, 16, 3, stride=(1, 2, 2), padding=1, output_padding=(0, 0, 0)),
+            nn.BatchNorm3d(16),
+            nn.ReLU(inplace=True),
+            nn.Dropout3d(dropout_rate)
+        )
+        
+        self.dec3 = nn.Sequential(
+            nn.ConvTranspose3d(16, 1, 3, stride=(1, 2, 2), padding=1, output_padding=(0, 1, 1)),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, x):
+        # Encode
+        x = self.enc1(x)
+        x = self.enc2(x)
+        x = self.enc3(x)
+        
+        # Latent
+        x = x.view(x.size(0), -1)
+        latent = self.fc_enc(x)
+        
+        # Decode
+        x = self.fc_dec(latent)
+        x = x.view(x.size(0), *self.encoder_shape)
+        
+        x = self.dec1(x)
+        x = self.dec2(x)
+        x = self.dec3(x)
+        
+        # Interpolate до точных размеров
+        x = F.interpolate(x, size=(self.target_depth, self.target_height, self.target_width),
+                          mode='trilinear', align_corners=False)
+        
+        return x, latent
+
+
+def get_model(name, **kwargs):
+    """Фабрика моделей"""
+    models = {
+        'Conv3DAutoencoder': Conv3DAutoencoder,
+        'SimpleConv3DAutoencoder': SimpleConv3DAutoencoder
+    }
+    
+    if name not in models:
+        raise ValueError(f"Неизвестная модель: {name}. Доступные: {list(models.keys())}")
+    
+    return models[name](**kwargs)
+
+
+if __name__ == "__main__":
+    # Тест моделей
+    input_shape = (1, 32, 96, 84)
+    
+    print("Тест Conv3DAutoencoder:")
+    model = Conv3DAutoencoder(latent_dim=64, input_shape=input_shape)
+    x = torch.randn(1, *input_shape)
+    out, latent = model(x)
+    print(f"  Вход: {x.shape}, Выход: {out.shape}, Latent: {latent.shape}")
+    
+    print("\nТест SimpleConv3DAutoencoder:")
+    model = SimpleConv3DAutoencoder(latent_dim=64, input_shape=input_shape)
+    out, latent = model(x)
+    print(f"  Вход: {x.shape}, Выход: {out.shape}, Latent: {latent.shape}")
